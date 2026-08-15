@@ -134,6 +134,74 @@ def volume_set(value: int):
             capture_output=True)
         return
 
+
+# ── Per-application volume (session volume) ──────────────────────────────────
+# The volume_up/down/set/mute functions above change the WINDOWS master volume.
+# These helpers instead target ONE app's audio session (e.g. Spotify, or the
+# browser playing the Spotify web player) via the Windows Core Audio session API,
+# leaving the master volume and every other app untouched.
+
+def _matching_audio_session(stems) -> object | None:
+    """Return the first audio session whose process name matches ``stems``."""
+    if _OS != "Windows":
+        return None
+    try:
+        from pycaw.pycaw import AudioUtilities
+        for s in AudioUtilities.GetAllSessions():
+            proc = getattr(s, "Process", None)
+            if proc is None:
+                continue
+            try:
+                pstem = (proc.name() or "").lower().rsplit(".", 1)[0]
+            except Exception:
+                continue
+            if any(st == pstem or st in pstem for st in stems):
+                return s
+    except Exception as e:
+        print(f"[Settings] _matching_audio_session failed: {e}")
+    return None
+
+
+def get_app_volume(stems) -> float | None:
+    """Current volume (0.0-1.0) of the first matching app session, or None."""
+    s = _matching_audio_session(stems)
+    if s is None or getattr(s, "SimpleAudioVolume", None) is None:
+        return None
+    try:
+        return float(s.SimpleAudioVolume.GetMasterVolume())
+    except Exception as e:
+        print(f"[Settings] get_app_volume failed: {e}")
+        return None
+
+
+def set_app_volume(stems, value: float) -> bool:
+    """Set the volume (0.0-1.0) of the first matching app session."""
+    s = _matching_audio_session(stems)
+    if s is None or getattr(s, "SimpleAudioVolume", None) is None:
+        return False
+    try:
+        s.SimpleAudioVolume.SetMasterVolume(max(0.0, min(1.0, float(value))), None)
+        return True
+    except Exception as e:
+        print(f"[Settings] set_app_volume failed: {e}")
+        return False
+
+
+def toggle_app_mute(stems) -> bool | None:
+    """Toggle mute on the first matching app session. Returns the new mute state
+    (True=muted, False=unmuted) or None if no session was found."""
+    s = _matching_audio_session(stems)
+    if s is None or getattr(s, "SimpleAudioVolume", None) is None:
+        return None
+    try:
+        new = not bool(s.SimpleAudioVolume.GetMute())
+        s.SimpleAudioVolume.SetMute(new, None)
+        return new
+    except Exception as e:
+        print(f"[Settings] toggle_app_mute failed: {e}")
+        return None
+
+
 def brightness_up():
     if _OS == "Darwin":
         subprocess.run(["osascript", "-e",

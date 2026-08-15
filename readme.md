@@ -80,6 +80,15 @@ When you ask JARVIS to look at your screen or camera, it no longer goes silent w
 ### 📰 Parallel News Search — First Result Wins
 News queries now run Gemini Grounded Search and DuckDuckGo news simultaneously in two threads. Whichever delivers a valid result first is used; the other is silently discarded. A Gemini 503 error no longer delays results — the DDG fallback is already running in parallel.
 
+### 🧠 Structured Multi-Layer Memory
+Memory is now organised into four persistent layers, each stored separately under `memory/store/`:
+- **Short-term** — current conversation, active task, recent context (auto-pruned)
+- **Long-term** — user preferences, habits, recurring patterns, durable facts
+- **Project** — project structure, technologies, configurations, past errors, fixes, decisions
+- **Episodic** — past sessions, completed tasks, changes made, important events
+
+JARVIS decides what to remember and **searches by meaning, not just keywords** — using Gemini `text-embedding-004` for semantic matching (with an automatic dependency-free lexical fallback). Near-duplicates are merged automatically, and newer facts overwrite stale ones, so memory stays clean without manual cleanup. Everything survives restarts and works alongside the existing flat `long_term.json` store.
+
 ---
 
 ## 🗺️ Mark Roadmap
@@ -145,14 +154,36 @@ Mark L/
 │   ├── code_helper.py        # Code review and generation
 │   ├── dev_agent.py          # Developer task agent
 │   └── desktop.py            # Desktop and taskbar control
+├── skills/                   # 🧩 Modular Skills/Plugins architecture
+│   ├── base.py               # Skill / Tool / SkillContext interface + SkillTestResult
+│   ├── manager.py            # SkillManager — detect · load · run · create · test · register
+│   ├── registry.py           # discovery + enable/disable/quarantine + persistent state
+│   ├── builder.py            # LLM-driven generation of new skills
+│   ├── dependencies.py       # safe dependency installation
+│   ├── tester.py             # import / schema / self-test harness
+│   ├── builtin/              # 9 built-in skills wrapping actions/ (browser, coding, files…)
+│   ├── custom/               # user-created skills (e.g. spotify/)
+│   └── config/skills.json    # skill state: enabled/disabled, permissions, failure counts
 ├── memory/
 │   ├── memory_manager.py     # Load/save long_term.json — sessions, monitors, identity
-│   └── long_term.json        # Persistent store: identity, preferences, projects, sessions, monitors
+│   ├── layered_memory.py     # 4-layer engine: semantic search, dedup, persistence
+│   ├── long_term.json        # Legacy flat store: identity, preferences, projects, sessions, monitors
+│   └── store/                # Per-layer stores: short_term / long_term / project / episodic
 ├── core/
 │   └── prompt.txt            # Assistant personality and tool-routing rules
 └── config/
     └── api_keys.json         # API key, OS setting, assistant name, user name
 ```
+
+---
+
+## 🧩 Skills / Plugins
+
+JARVIS is now built from **isolated, dynamically loadable skills**. Each skill declares its metadata, Gemini tool schemas, permissions, dependencies and configuration, and is loaded, tested, enabled and disabled independently of the rest.
+
+- **Detect & route** — Gemini function-calling picks the right tool; `SkillManager` routes it to the owning skill and enforces permissions.
+- **Create on demand** — say *"JARVIS, add Spotify control"* and JARVIS generates the skill via Gemini, installs its dependencies safely, tests it, and registers it — then *"Play my playlist"* just works.
+- **Safe failure** — a skill that fails three times in a row is auto-quarantined; disabling/removing a broken skill never affects the others.
 
 ---
 
@@ -163,12 +194,3 @@ Licensed under **[Creative Commons BY-NC 4.0](https://creativecommons.org/licens
 
 ---
 
-## 👤 Connect with the Creator
-
-Engineered by a developer building a real-world JARVIS-style assistant.
-⭐ **Star the repository to support the journey to Mark 100.**
-
-| Platform | Link |
-| --- | --- |
-| YouTube | [@FatihMakes](https://www.youtube.com/@FatihMakes) |
-| Instagram | [@fatihmakes](https://www.instagram.com/fatihmakes) |

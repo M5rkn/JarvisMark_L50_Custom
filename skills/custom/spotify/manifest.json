@@ -1,0 +1,42 @@
+{
+  "name": "spotify",
+  "display_name": "Spotify",
+  "description": "Spotify-specific actions only: open Spotify, play a playlist/track by name, or adjust Spotify's OWN volume (per-app — does not touch the Windows master volume). For simple transport controls (play/resume, pause, next, previous, stop) and the WINDOWS master volume use the media_control tool instead.",
+  "version": "1.0.0",
+  "entrypoint": "skill.py",
+  "class_name": "Skill",
+  "permissions": ["browser", "network", "media_control"],
+  "dependencies": [],
+  "config": {
+    "mode": "web"
+  },
+  "config_schema": {},
+  "tools": [
+    {
+      "name": "spotify_control",
+      "description": "Spotify-specific actions. Use for: open Spotify (action='open'), play a playlist by name (action='play_playlist' with name=<playlist name>), play a track/song by name (action='play_track' with query=<song name>), and control Spotify's OWN volume — volume_up, volume_down, volume_set (with value=0-100), mute. Do NOT use for play/pause/next/previous/stop or the Windows master volume — those go to media_control.",
+      "parameters": {
+        "type": "OBJECT",
+        "properties": {
+          "action": {
+            "type": "STRING",
+            "description": "open | play_playlist | play_track | volume_up | volume_down | volume_set | mute"
+          },
+          "name": {
+            "type": "STRING",
+            "description": "Playlist name for play_playlist action"
+          },
+          "query": {
+            "type": "STRING",
+            "description": "Track/song name for play_track action"
+          },
+          "value": {
+            "type": "NUMBER",
+            "description": "Target volume 0-100 for volume_set action"
+          }
+        },
+        "required": ["action"]
+      }
+    }
+  ]
+}

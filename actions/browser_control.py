@@ -390,6 +390,103 @@ def _kill_chrome_and_wait() -> None:
     time.sleep(2.0)
 
 
+# ── OS-level browser process close (works regardless of window focus) ─────────
+# browser_control's close/close_all historically only closed the Playwright
+# automation session. If the user opened the browser natively (open_app) or by
+# hand, there was no session — so JARVIS reported "closed" while the real window
+# stayed in the taskbar. These helpers kill the actual browser process tree so
+# the browser is truly gone no matter which app currently has focus.
+
+_BROWSER_PROCESS_STEMS: dict[str, tuple[str, ...]] = {
+    "chrome":   ("chrome", "chromium"),
+    "edge":     ("msedge",),
+    "firefox":  ("firefox",),
+    "brave":    ("brave",),
+    "vivaldi":  ("vivaldi",),
+    "opera":    ("opera",),
+    "operagx":  ("opera",),
+}
+
+
+def _browser_process_stems(browser_name: str) -> tuple[str, ...]:
+    name = _ALIASES.get((browser_name or "").lower().strip(),
+                         (browser_name or "").lower().strip())
+    if name in _BROWSER_PROCESS_STEMS:
+        return _BROWSER_PROCESS_STEMS[name]
+    return (name,) if name else ()
+
+
+def _kill_processes_by_stem(stems: tuple[str, ...]) -> bool:
+    """Kill every process whose name stem matches one of ``stems``.
+
+    Returns True if any process was killed. Uses psutil (cross-platform) first,
+    then a native kill as a fallback on Windows/macOS/Linux.
+    """
+    if not stems:
+        return False
+    killed_any = False
+
+    try:
+        import psutil
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pname = (proc.info["name"] or "").lower()
+                pstem = pname.rsplit(".", 1)[0]
+                if any(s == pstem or s in pstem for s in stems):
+                    proc.kill()
+                    killed_any = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception as e:
+        print(f"[Browser] psutil kill failed: {e}")
+
+    if _OS == "Windows":
+        for s in stems:
+            try:
+                r = subprocess.run(
+                    ["taskkill", "/IM", f"{s}.exe", "/F", "/T"],
+                    capture_output=True, timeout=10,
+                )
+                if r.returncode == 0:
+                    killed_any = True
+            except Exception as e:
+                print(f"[Browser] taskkill {s} failed: {e}")
+    elif _OS == "Darwin":
+        for s in stems:
+            try:
+                if subprocess.run(["pkill", "-x", s],
+                                  capture_output=True, timeout=10).returncode == 0:
+                    killed_any = True
+            except Exception:
+                pass
+    else:
+        for s in stems:
+            try:
+                if subprocess.run(["pkill", "-f", s],
+                                  capture_output=True, timeout=10).returncode == 0:
+                    killed_any = True
+            except Exception:
+                pass
+
+    if killed_any:
+        time.sleep(0.5)   # let the process tree actually terminate
+    return killed_any
+
+
+def _force_close_browser_processes(browser_name: str) -> bool:
+    """Kill the real browser process(es) regardless of which app has focus."""
+    return _kill_processes_by_stem(_browser_process_stems(browser_name))
+
+
+def _force_close_all_browsers() -> bool:
+    stems: list[str] = []
+    for group in _BROWSER_PROCESS_STEMS.values():
+        for s in group:
+            if s not in stems:
+                stems.append(s)
+    return _kill_processes_by_stem(tuple(stems))
+
+
 def _wait_for_cdp(timeout: float = 30.0) -> bool:
     import urllib.request
     # Bypass any system proxy — the CDP endpoint is localhost-only.
@@ -957,9 +1054,35 @@ class _BrowserSession:
 
     async def _acquire(self):
         """Attach to the real browser via CDP if possible, else launch the
-        automation profile. Idempotent."""
-        if self._browser is not None or self._context is not None:
-            return
+        automation profile. Idempotent and self-healing: if the previously held
+        browser/context was closed externally (e.g. the user closed Chrome), the
+        stale references are dropped and a fresh backend is acquired instead of
+        failing with "Target page, context or browser has been closed"."""
+        # Drop stale handles first — a closed browser/context keeps non-None
+        # references, so a naive `is not None` check would reuse a dead backend.
+        if self._browser is not None:
+            try:
+                if self._browser.is_connected():
+                    return
+            except Exception:
+                pass
+            self._browser = None
+            self._context = None
+            self._page    = None
+
+        if self._context is not None:
+            alive = False
+            try:
+                _browser = self._context.browser
+                if _browser is not None and _browser.is_connected():
+                    alive = True
+            except Exception:
+                alive = False
+            if alive:
+                return
+            self._context = None
+            self._page    = None
+
         if self._spec and self._spec.get("engine") == "chromium":
             if await self._try_attach_cdp():
                 return
@@ -1752,14 +1875,26 @@ class _SessionRegistry:
         return f"Active browser → {browser_name}"
 
     def close_one(self, browser_name: str) -> str:
+        name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
         with self._lock:
-            sess = self._sessions.pop(browser_name, None)
-        if sess:
-            sess.close()
-            if self._active_browser == browser_name:
+            sess = self._sessions.pop(name, None)
+            if self._active_browser == name:
                 self._active_browser = ""
-            return f"{browser_name} closed."
-        return f"No active session for: {browser_name}"
+        closed = False
+        if sess:
+            try:
+                sess.close()
+                closed = True
+            except Exception as e:
+                print(f"[Registry] session close failed for {name}: {e}")
+        # Always also kill the real browser process. The Playwright session may
+        # have been an automation profile, while the window the user actually
+        # sees in the taskbar was opened natively / manually and has no session.
+        if _force_close_browser_processes(name):
+            closed = True
+        if closed:
+            return f"{name} closed."
+        return f"No running {name} found to close."
 
     def close_all(self) -> str:
         with self._lock:
@@ -1772,7 +1907,10 @@ class _SessionRegistry:
                 s.close()
             except Exception:
                 pass
-        return "All browsers closed: " + (", ".join(names) if names else "none")
+        killed = _force_close_all_browsers()
+        if names or killed:
+            return "All browsers closed: " + (", ".join(names) if names else "all running browser processes")
+        return "No browsers were running."
 
     def list_sessions(self) -> str:
         with self._lock:
@@ -1823,8 +1961,8 @@ def browser_control(
         return result
 
     if action == "close":
-        target = browser or _registry._active_browser
-        result = _registry.close_one(target) if target else "No browser specified."
+        target = browser or _registry._active_browser or _detect_default_browser()
+        result = _registry.close_one(target)
         _log(player, result)
         return result
 

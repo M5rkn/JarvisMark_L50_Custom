@@ -269,3 +269,51 @@ def pop_last_session() -> dict | None:
         except Exception as e:
             print(f"[Memory] ⚠️ pop_last_session error: {e}")
             return None
+
+
+# ── Multi-layer structured memory bridge ───────────────────────────────────────
+# The layered engine (memory/layered_memory.py) adds short-term / long-term /
+# project / episodic layers with semantic search, dedup and automatic update of
+# outdated facts. These thin wrappers keep that system reachable without the
+# legacy callers needing to know about it, and without breaking anything that
+# still reads the flat long_term.json categories above.
+
+def search_memory(query: str, layers=None, top_k: int = 5) -> list[dict]:
+    """Semantic/context search across the layered store."""
+    from memory.layered_memory import search
+    return search(query, layers=layers, top_k=top_k)
+
+
+def recall_memory(query: str, layers=None, top_k: int = 5) -> str:
+    """Formatted memory lookup for the assistant (natural-language text)."""
+    from memory.layered_memory import recall
+    return recall(query, layers=layers, top_k=top_k)
+
+
+def add_layer_memory(content: str, layer: str = "long_term", labels=None,
+                     importance: float = 0.5, source: str = "auto",
+                     kind: str = None, date: str = None) -> dict:
+    """Write a structured memory entry into one of the four layers."""
+    from memory.layered_memory import add_memory
+    return add_memory(
+        content=content, layer=layer, labels=labels, importance=importance,
+        source=source, kind=kind, date=date,
+    )
+
+
+def guess_memory_layer(content: str) -> str:
+    """Best-effort layer classification for free-form memory content."""
+    from memory.layered_memory import guess_layer
+    return guess_layer(content)
+
+
+def record_session_event(summary: str, language: str = "") -> dict:
+    """Persist a session summary into the episodic layer."""
+    from memory.layered_memory import record_session
+    return record_session(summary, language)
+
+
+def format_layered_memory_context(max_chars: int = 1800) -> str:
+    """Compact snapshot of the layered store for system-prompt injection."""
+    from memory.layered_memory import format_context
+    return format_context(max_chars=max_chars)

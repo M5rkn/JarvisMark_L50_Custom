@@ -38,6 +38,8 @@ from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     save_session_summary,
+    recall_memory, add_layer_memory, guess_memory_layer,
+    record_session_event, format_layered_memory_context,
 )
 
 from actions.file_processor import file_processor
@@ -63,6 +65,7 @@ from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from memory.config_manager     import get_brief_enabled
+from skills.manager            import SkillManager
 
 
 def get_base_dir():
@@ -74,7 +77,7 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
+LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-latest"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -597,6 +600,127 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "add_memory",
+        "description": (
+            "Add a fact/event to structured multi-layer memory. Call this silently "
+            "whenever the user reveals something worth remembering. JARVIS decides "
+            "which layer fits best (or pass 'auto' to have it inferred):\n"
+            "  short_term — current active task, what is happening right now\n"
+            "  long_term  — preferences, habits, recurring patterns, durable facts\n"
+            "  project    — project structure, technologies, configs, errors, fixes, decisions\n"
+            "  episodic   — past sessions, completed tasks, changes made, important events\n"
+            "Near-duplicate entries are automatically merged (no repeats). "
+            "Do NOT announce that you are saving — just call it silently."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "content":    {"type": "STRING", "description": "The fact/event to remember, one clear sentence"},
+                "layer":      {"type": "STRING", "description": "short_term | long_term | project | episodic | auto (default: auto)"},
+                "labels":     {"type": "ARRAY",  "items": {"type": "STRING"}, "description": "Optional tags (e.g. ['python', 'bug'])"},
+                "importance": {"type": "NUMBER",  "description": "Optional importance 0.0-1.0 (default 0.5)"},
+                "kind":       {"type": "STRING", "description": "Episodic kind: session | task | change | event"},
+            },
+            "required": ["content"]
+        }
+    },
+    {
+        "name": "recall_memory",
+        "description": (
+            "Search stored memories by meaning/context (not just exact keywords). "
+            "Use whenever you need to recall a past fact, preference, project detail, "
+            "previous error/fix, or what happened in an earlier session. "
+            "Call this BEFORE guessing — it returns the most relevant memories."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query":  {"type": "STRING", "description": "What you are trying to recall, phrased naturally"},
+                "layers": {"type": "ARRAY",  "items": {"type": "STRING"}, "description": "Optional: short_term | long_term | project | episodic"},
+                "top_k":  {"type": "INTEGER", "description": "Max results to return (default 5)"},
+            },
+            "required": ["query"]
+        }
+    },
+]
+
+# ── Core vs. skill-owned tool routing ─────────────────────────────────────────
+# The tool names below remain handled inline by JarvisLive (lifecycle, vision,
+# memory). Every other tool is now owned by a skill under skills/ and is routed
+# through SkillManager (skills/manager.py). The legacy TOOL_DECLARATIONS list is
+# kept as the schema source; CORE_TOOL_DECLARATIONS extracts only the core names
+# from it so the modular system is the single source of truth for enable/disable.
+_CORE_TOOL_NAMES = {
+    "get_current_time",
+    "screen_process",
+    "close_camera",
+    "manage_monitor",
+    "shutdown_jarvis",
+    "restart_jarvis",
+    "save_memory",
+    "add_memory",
+    "recall_memory",
+}
+
+CORE_TOOL_DECLARATIONS = [
+    t for t in TOOL_DECLARATIONS if t["name"] in _CORE_TOOL_NAMES
+]
+
+# Tools that let JARVIS manage the skill system itself (create / list / remove /
+# disable / enable skills) — always available, never disabled.
+SKILL_MGMT_TOOL_DECLARATIONS = [
+    {
+        "name": "add_skill",
+        "description": (
+            "Adds a brand-new capability/skill to JARVIS when the requested capability "
+            "does not already exist. Use this when the user asks to add, install, create, "
+            "or give JARVIS a new feature or integration (e.g. 'add Spotify control', "
+            "'add email support', 'can you control my smart lights?'). "
+            "JARVIS generates, installs dependencies, tests and registers the skill "
+            "automatically, then confirms what it can now do."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "description": {"type": "STRING", "description": "What the new skill/capability should do (required)"},
+                "name":        {"type": "STRING", "description": "Optional skill name (snake_case)"},
+            },
+            "required": ["description"],
+        },
+    },
+    {
+        "name": "list_skills",
+        "description": "Lists all installed skills and whether each is enabled or disabled.",
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
+        "name": "remove_skill",
+        "description": "Removes (and disables) a skill by name. Only for skills the user wants gone.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"name": {"type": "STRING", "description": "Skill name"}},
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "disable_skill",
+        "description": "Disables a skill by name without deleting it.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"name": {"type": "STRING", "description": "Skill name"}},
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "enable_skill",
+        "description": "Re-enables a previously disabled skill by name.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"name": {"type": "STRING", "description": "Skill name"}},
+            "required": ["name"],
+        },
+    },
 ]
 
 # --- Plugin system ---
@@ -607,6 +731,15 @@ class JarvisLive:
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
         self._asst_name     = "JARVIS"   # updated each session from config
+        # Modular Skills/Plugins system. Safely optional: if it ever fails to
+        # initialise, JARVIS falls back to the legacy hardcoded dispatch.
+        try:
+            self.skill_manager = SkillManager(
+                base_dir=BASE_DIR, ui=self.ui, speak=self.speak, api_key=_get_api_key
+            )
+        except Exception as e:
+            print(f"[Skills] ⚠️ skill system disabled: {e}")
+            self.skill_manager = None
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
@@ -629,6 +762,9 @@ class JarvisLive:
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
+        self._mic_voice_time   = 0.0               # monotonic time of last local voice detection
+        self._model_activity   = 0.0               # monotonic time of last server message
+        self._tool_busy        = False             # True while a tool call is executing
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
     def _make_remote_key(self):
@@ -714,6 +850,14 @@ class JarvisLive:
         mem_str    = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
 
+        # Structured multi-layer context (short-term / long-term / project /
+        # episodic). Kept compact and appended only when non-empty.
+        layered_str = ""
+        try:
+            layered_str = format_layered_memory_context()
+        except Exception as e:
+            print(f"[Memory] ⚠️ layered context failed: {e}")
+
         now      = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
         time_ctx = (
@@ -739,14 +883,28 @@ class JarvisLive:
         parts = [time_ctx, identity_ctx]
         if mem_str:
             parts.append(mem_str)
+        if layered_str:
+            parts.append(layered_str)
         parts.append(sys_prompt)
+
+        # Build the Gemini tool list dynamically: core tools + skill-management
+        # tools + every ENABLED skill's tools. Disabled/broken skills are omitted,
+        # so they are simply not offered to the model.
+        if self.skill_manager:
+            declarations = (
+                CORE_TOOL_DECLARATIONS
+                + SKILL_MGMT_TOOL_DECLARATIONS
+                + self.skill_manager.tool_declarations()
+            )
+        else:
+            declarations = TOOL_DECLARATIONS   # fallback: legacy behaviour
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
             input_audio_transcription={},
             system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
+            tools=[{"function_declarations": declarations}],
             session_resumption=types.SessionResumptionConfig(),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
@@ -770,6 +928,15 @@ class JarvisLive:
             value    = args.get("value", "")
             if key and value:
                 update_memory({category: {key: {"value": value}}})
+                # Mirror into the structured long-term layer so the fact is
+                # also semantically searchable later (dedup prevents repeats).
+                try:
+                    add_layer_memory(
+                        f"{key.replace('_', ' ')}: {value}",
+                        layer="long_term", labels=[category, key], source="auto",
+                    )
+                except Exception as e:
+                    print(f"[Memory] ⚠️ layered mirror failed: {e}")
                 print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
@@ -778,8 +945,77 @@ class JarvisLive:
                 response={"result": "ok", "silent": True}
             )
 
+        if name == "add_memory":
+            content = (args.get("content") or "").strip()
+            if content:
+                layer = (args.get("layer") or "auto").strip()
+                if layer not in ("short_term", "long_term", "project", "episodic"):
+                    layer = guess_memory_layer(content)
+                labels = list(args.get("labels") or [])
+                try:
+                    importance = float(args.get("importance", 0.5))
+                except (TypeError, ValueError):
+                    importance = 0.5
+                try:
+                    add_layer_memory(
+                        content, layer=layer, labels=labels,
+                        importance=importance, source="auto",
+                        kind=args.get("kind"),
+                    )
+                except Exception as e:
+                    print(f"[Memory] ⚠️ add_memory failed: {e}")
+                print(f"[Memory] 🧠 add_memory ({layer}): {content[:60]}")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "ok", "silent": True}
+            )
+
+        if name == "recall_memory":
+            query  = (args.get("query") or "").strip()
+            layers = args.get("layers")
+            try:
+                top_k = int(args.get("top_k") or 5)
+            except (TypeError, ValueError):
+                top_k = 5
+            result = "No relevant memories found."
+            if query:
+                try:
+                    result = await asyncio.to_thread(recall_memory, query, layers, top_k)
+                except Exception as e:
+                    result = f"Memory recall failed: {e}"
+                    print(f"[Memory] ⚠️ recall_memory: {e}")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": result}
+            )
+
         loop   = asyncio.get_event_loop()
         result = "Done."
+
+        # ── Modular skill routing ─────────────────────────────────────────────
+        # If a skill owns this tool name, delegate to the SkillManager. Disabled
+        # or broken skills raise here (and are auto-quarantined after repeated
+        # failures) instead of silently falling through to legacy handling.
+        if self.skill_manager and self.skill_manager.handles(name):
+            try:
+                result = await loop.run_in_executor(
+                    None, self.skill_manager.run, name, args
+                )
+            except Exception as e:
+                result = f"Tool '{name}' failed: {e}"
+                traceback.print_exc()
+                self.speak_error(name, e)
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": result}
+            )
 
         try:
             if name == "open_app":
@@ -972,6 +1208,35 @@ class JarvisLive:
                         _os._exit(1)
                 asyncio.create_task(_do_restart())
 
+            elif name == "add_skill":
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: self.skill_manager.create_skill(
+                        description=args.get("description", ""),
+                        name=args.get("name"),
+                        auto_approve=True,
+                        auto_install=True,
+                    ),
+                )
+
+            elif name == "list_skills":
+                result = self.skill_manager.list_skills()
+
+            elif name == "remove_skill":
+                result = await loop.run_in_executor(
+                    None, lambda: self.skill_manager.remove_skill(args.get("name", ""))
+                )
+
+            elif name == "disable_skill":
+                result = await loop.run_in_executor(
+                    None, lambda: self.skill_manager.disable_skill(args.get("name", ""))
+                )
+
+            elif name == "enable_skill":
+                result = await loop.run_in_executor(
+                    None, lambda: self.skill_manager.enable_skill(args.get("name", ""))
+                )
+
             else:
                 result = f"Unknown tool: {name}"
 
@@ -1002,6 +1267,11 @@ class JarvisLive:
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
+                # Local voice-activity detection: marks real mic speech so the
+                # watchdog can tell "model is deaf" apart from "user is silent".
+                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                if rms > 500.0:
+                    self._mic_voice_time = time.monotonic()
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
@@ -1030,6 +1300,7 @@ class JarvisLive:
         try:
             while True:
                 async for response in self.session.receive():
+                    self._model_activity = time.monotonic()
 
                     if response.data:
                         if self._interrupted:
@@ -1126,14 +1397,18 @@ class JarvisLive:
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
+                        self._tool_busy = True
+                        try:
+                            fn_responses = []
+                            for fc in response.tool_call.function_calls:
+                                print(f"[JARVIS] 📞 {fc.name}")
+                                fr = await self._execute_tool(fc)
+                                fn_responses.append(fr)
+                            await self.session.send_tool_response(
+                                function_responses=fn_responses
+                            )
+                        finally:
+                            self._tool_busy = False
         except Exception as e:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
@@ -1267,6 +1542,10 @@ class JarvisLive:
             summary = (resp.text or "").strip()
             if summary:
                 save_session_summary(summary, lang)
+                try:
+                    record_session_event(summary, lang)
+                except Exception as e:
+                    print(f"[Memory] ⚠️ episodic save failed: {e}")
         except Exception as e:
             print(f"[Memory] ⚠️ Session summary failed: {e}")
 
@@ -1365,6 +1644,33 @@ class JarvisLive:
                 self.ui.write_log("SYS: Proactive check-in.")
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
+
+    # ── Stalled-session watchdog ──────────────────────────────────────────────
+
+    async def _watchdog(self) -> None:
+        """Force a reconnect if the model goes silent while the user is speaking."""
+        STALL_SECONDS = 15.0
+        while True:
+            await asyncio.sleep(5.0)
+            if not self.session:
+                continue
+            if self._tool_busy or self._vision_busy:
+                continue
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking or self.ui.muted:
+                continue
+            now = time.monotonic()
+            if now - self._mic_voice_time >= 10.0:
+                continue   # user hasn't spoken recently — idle, not stalled
+            if now - self._model_activity < STALL_SECONDS:
+                continue
+            print("[Watchdog] ⚠️ Model silent while user speaking — forcing reconnect.")
+            self.ui.write_log("SYS: No response — reconnecting...")
+            try:
+                await self.session.close()
+            except Exception:
+                pass
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
@@ -1465,10 +1771,18 @@ class JarvisLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._tool_busy            = False
+                    self._mic_voice_time       = time.monotonic()
+                    self._model_activity       = time.monotonic()
 
                     print("[JARVIS] Connected.")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
+
+                    # A clean connection clears any accumulated reconnect
+                    # backoff, so a one-off hiccup never leaves JARVIS waiting
+                    # through a long 60s delay afterwards.
+                    self._conn_backoff = 3
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
@@ -1477,6 +1791,7 @@ class JarvisLive:
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
+                    tg.create_task(self._watchdog())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
@@ -1513,9 +1828,14 @@ class JarvisLive:
                     _conn_backoff = 3
                     continue
 
-                # Network / timeout errors — log clearly and back off
+                # Network / timeout errors — log clearly and back off.
+                # "CancelledError" is deliberately NOT treated as a network
+                # error: it is the normal by-product of the watchdog (or any
+                # task-group teardown) closing the session, and treating it as a
+                # network failure made the reconnect backoff balloon to 60s,
+                # which is why JARVIS looked "dead" until it was poked again.
                 is_net_err = any(k in err_str for k in (
-                    "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
+                    "TimeoutError", "timed out", "getaddrinfo",
                     "ConnectionRefusedError", "OSError", "Cannot connect",
                 ))
                 if is_net_err:

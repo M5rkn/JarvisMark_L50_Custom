@@ -1,0 +1,136 @@
+{
+  "skills": {
+    "spotify": {
+      "enabled": true,
+      "builtin": false,
+      "tools": [
+        "spotify_control"
+      ],
+      "permissions_granted": [
+        "browser",
+        "network",
+        "media_control"
+      ],
+      "failure_count": 0,
+      "config": {
+        "mode": "web"
+      }
+    },
+    "browser": {
+      "builtin": true,
+      "tools": [
+        "browser_control"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "browser",
+        "network"
+      ],
+      "config": {},
+      "failure_count": 0
+    },
+    "coding": {
+      "builtin": true,
+      "tools": [
+        "code_helper",
+        "dev_agent"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "filesystem",
+        "execution"
+      ],
+      "config": {}
+    },
+    "files": {
+      "builtin": true,
+      "tools": [
+        "file_controller",
+        "file_processor"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "filesystem"
+      ],
+      "config": {}
+    },
+    "youtube": {
+      "builtin": true,
+      "tools": [
+        "youtube_video"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "browser",
+        "network",
+        "media_control"
+      ],
+      "config": {}
+    },
+    "telegram": {
+      "builtin": true,
+      "tools": [
+        "send_message"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "messaging"
+      ],
+      "config": {}
+    },
+    "system": {
+      "builtin": true,
+      "tools": [
+        "open_app",
+        "computer_settings",
+        "computer_control",
+        "desktop_control",
+        "game_updater",
+        "reminder",
+        "system_status"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "system_control",
+        "execution"
+      ],
+      "config": {}
+    },
+    "research": {
+      "builtin": true,
+      "tools": [
+        "web_search",
+        "flight_finder",
+        "weather_report"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "network",
+        "browser"
+      ],
+      "config": {}
+    },
+    "finance": {
+      "builtin": true,
+      "tools": [
+        "finance"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "network"
+      ],
+      "config": {}
+    },
+    "media": {
+      "builtin": true,
+      "tools": [
+        "media_control"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "media_control"
+      ],
+      "config": {}
+    }
+  }
+}
