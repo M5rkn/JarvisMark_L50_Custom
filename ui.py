@@ -37,7 +37,7 @@ else:
     _WIN_HIDE: dict = {}
 
 from PyQt6.QtCore import (
-    QPointF, QRectF, Qt, QTimer, pyqtSignal,
+    QAbstractNativeEventFilter, QPointF, QRectF, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
@@ -3183,6 +3183,88 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.on_text_command, args=(cmd,), daemon=True).start()
 
 
+class _GlobalHotkeyFilter(QAbstractNativeEventFilter):
+    """System-wide F4 hotkey that toggles the mic mute from any application.
+
+    QShortcut / keyPressEvent only fire when JARVIS has focus. This registers
+    a global hotkey via the Win32 RegisterHotKey API (ctypes — no new
+    dependency) and receives WM_HOTKEY through Qt's native event filter, so it
+    keeps working when JARVIS is minimised or another app is focused.
+    """
+
+    _WM_HOTKEY = 0x0312
+    _VK_F4 = 0x73
+    _HOTKEY_ID = 0xF4
+
+    def __init__(self, callback):
+        super().__init__()
+        self._callback = callback
+        self._registered = False
+        self._msg_type = None
+
+    def register(self) -> bool:
+        if platform.system() != "Windows":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _POINT(ctypes.Structure):
+                _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+            class _MSG(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd", wintypes.HWND),
+                    ("message", wintypes.UINT),
+                    ("wParam", ctypes.c_size_t),
+                    ("lParam", ctypes.c_size_t),
+                    ("time", wintypes.DWORD),
+                    ("pt", _POINT),
+                ]
+
+            self._msg_type = _MSG
+
+            user32 = ctypes.windll.user32
+            user32.RegisterHotKey.argtypes = [
+                wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+            user32.RegisterHotKey.restype = wintypes.BOOL
+            self._registered = bool(
+                user32.RegisterHotKey(None, self._HOTKEY_ID, 0, self._VK_F4))
+        except Exception as e:
+            print(f"[UI] ⚠️ global hotkey register failed: {e}")
+            self._registered = False
+        return self._registered
+
+    def unregister(self) -> None:
+        if not self._registered:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.UnregisterHotKey.restype = wintypes.BOOL
+            user32.UnregisterHotKey(None, self._HOTKEY_ID)
+        except Exception:
+            pass
+        self._registered = False
+
+    def nativeEventFilter(self, eventType, message):
+        if not self._registered or self._msg_type is None:
+            return False, 0
+        try:
+            msg = self._msg_type.from_address(int(message))
+            if msg.message == self._WM_HOTKEY and int(msg.wParam) == self._HOTKEY_ID:
+                try:
+                    self._callback()
+                except Exception as e:
+                    print(f"[UI] ⚠️ hotkey callback failed: {e}")
+                return True, 0
+        except Exception:
+            pass
+        return False, 0
+
+
 class _RootShim:
     def __init__(self, app: QApplication):
         self._app = app
@@ -3459,6 +3541,13 @@ class JarvisUI:
         _show_startup_splash(str(_splash) if _splash.exists() else "", seconds=7.0, music=music)
 
         self.root = _RootShim(self._app)
+
+        # Global F4 hotkey — mute/unmute the mic from any app, even unfocused.
+        self._hotkey_filter = _GlobalHotkeyFilter(self._win._toggle_mute)
+        self._app.installNativeEventFilter(self._hotkey_filter)
+        if not self._hotkey_filter.register():
+            print("[UI] ⚠️ F4 hotkey not registered (already in use by another app?)")
+        self._app.aboutToQuit.connect(self._hotkey_filter.unregister)
 
     @property
     def muted(self) -> bool:
