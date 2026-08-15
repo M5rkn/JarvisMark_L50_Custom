@@ -1,0 +1,31 @@
+# ── Virtual environment ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Python bytecode / cache ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# ── Secrets & personal data — DO NOT COMMIT ──────────────────────────────
+config/api_keys.json
+memory/long_term.json
+
+# ── TLS private keys / certificates ──────────────────────────────────────
+config/certs/
+
+# ── OS / editor / misc ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+.vscode/
+.idea/
+.qwen/
