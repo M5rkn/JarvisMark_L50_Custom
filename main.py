@@ -142,6 +142,18 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "get_current_time",
+        "description": (
+            "Returns the exact current date and time right now. Use this whenever the user "
+            "asks for the current time, date, or day of week, or when calculating times for "
+            "reminders and schedules. Always call this instead of answering from memory."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+        }
+    },
+    {
         "name": "system_status",
         "description": (
             "Returns real-time system metrics: CPU usage, RAM, GPU load, CPU temperature, "
@@ -705,9 +717,9 @@ class JarvisLive:
         now      = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
         time_ctx = (
-            f"[CURRENT DATE & TIME]\n"
-            f"Right now it is: {time_str}\n"
-            f"Use this to calculate exact times for reminders.\n\n"
+            f"[SESSION START TIME]\n"
+            f"The session started at: {time_str}\n"
+            f"For the CURRENT time or date, always call get_current_time — never rely on this value.\n\n"
         )
 
         # Identity injection — overrides any hardcoded name in prompt.txt
@@ -878,6 +890,9 @@ class JarvisLive:
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
+
+            elif name == "get_current_time":
+                result = datetime.now().strftime("%A, %B %d, %Y — %I:%M %p")
 
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
