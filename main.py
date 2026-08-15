@@ -1246,7 +1246,7 @@ class JarvisLive:
             client = _genai.Client(api_key=_get_api_key())
             resp   = await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-2.5-flash",
+                model="gemini-3.7-flash",
                 contents=prompt,
             )
             summary = (resp.text or "").strip()
