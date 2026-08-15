@@ -992,7 +992,7 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            await self.session.send_realtime_input(audio=msg)
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
