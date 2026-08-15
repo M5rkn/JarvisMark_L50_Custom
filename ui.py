@@ -683,7 +683,8 @@ class JarvisCore(QWidget):
         halo.setColorAt(1.0, qcol(acc, 0))
         p.fillRect(self.rect(), QBrush(halo))
 
-        # 2) face — faint, behind the core
+        # 2) face — faint, behind the core (the startup photo is shown as a
+        # separate splash before this window appears)
         if self._face_px:
             fsz = int(fw * 0.30)
             scaled = self._face_px.scaled(
@@ -3205,6 +3206,229 @@ def _apply_windows_app_id() -> None:
         print(f"[UI] ⚠️ AppUserModelID failed: {e}")
 
 
+def _find_splash_music() -> str:
+    """Locate the splash music file (e.g. AC/DC — Back in Black), or ''."""
+    exts = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac")
+    names = (
+        "back_in_black", "back in black", "Back In Black", "Back_In_Black",
+        "backinblack", "BackInBlack",
+    )
+    search_dirs = [
+        BASE_DIR / "music",
+        BASE_DIR,
+        Path.home() / "Music",
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
+    ]
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        for name in names:
+            for ext in exts:
+                p = d / (name + ext)
+                if p.exists():
+                    return str(p)
+    return ""
+
+
+def _pick_output_device_index() -> int | None:
+    """Index of a physical output device (skip SteelSeries Sonar virtual channels)."""
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    except Exception:
+        return None
+    _skip = ("virtual", "sonar", "microphone", "mic", "chat", "stream",
+             "spdif", "digital", "переназначение")
+
+    def _physical(d):
+        if d["max_output_channels"] <= 0:
+            return False
+        name = (d["name"] or "").lower()
+        if any(b in name for b in _skip):
+            return False
+        return any(k in name for k in ("динамики", "speaker", "наушники", "headphone"))
+
+    candidates = [i for i, d in enumerate(devices) if _physical(d)]
+    if not candidates:
+        candidates = [i for i, d in enumerate(devices)
+                      if d["max_output_channels"] > 0
+                      and not any(b in (d["name"] or "").lower() for b in _skip)]
+    if not candidates:
+        return None
+    # Prefer WASAPI (cleanest Windows output), otherwise the first match.
+    for i in candidates:
+        h = int(devices[i].get("hostapi") or 0)
+        if h < len(hostapis) and "wasapi" in (hostapis[h]["name"] or "").lower():
+            return i
+    return candidates[0]
+
+
+def _decode_splash_music(path: str, seconds: float = 8.0, sample_rate: int = 44100,
+                         volume: float = 1.0):
+    """Decode the first `seconds` of the music to float32 PCM via ffmpeg.
+
+    Returns (audio, sample_rate) or (None, None). This keeps the heavy decode
+    OUT of the Qt Multimedia backend — we only feed PCM to sounddevice.
+    """
+    try:
+        import subprocess
+        import numpy as np
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        print(f"[UI] music decode unavailable: {e}")
+        return None, None
+    sample_rate = int(sample_rate) or 44100
+    cmd = [
+        ffmpeg, "-y", "-i", path, "-t", f"{seconds:.1f}",
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ar", str(sample_rate), "-ac", "2", "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    except Exception as e:
+        print(f"[UI] music decode failed: {e}")
+        return None, None
+    if proc.returncode != 0 or not proc.stdout:
+        return None, None
+    raw = np.frombuffer(proc.stdout, dtype=np.int16)
+    if raw.size == 0:
+        return None, None
+    audio = raw.reshape(-1, 2).astype(np.float32) / 32768.0
+    if volume != 1.0:
+        audio *= float(volume)
+    return audio, sample_rate
+
+
+def _apply_fade_out(audio, sample_rate: int, fade_seconds: float) -> None:
+    """Linearly fade out the last `fade_seconds` of the audio in-place."""
+    try:
+        import numpy as np
+    except Exception:
+        return
+    n = int(sample_rate * fade_seconds)
+    if n <= 0 or n >= len(audio):
+        return
+    ramp = np.linspace(1.0, 0.0, n, dtype=np.float32)[:, None]
+    audio[-n:] = audio[-n:] * ramp
+
+
+def _wait_ui(seconds: float) -> None:
+    end = time.time() + seconds
+    while time.time() < end:
+        QApplication.processEvents()
+        time.sleep(0.02)
+
+
+def _fade_opacity(effect, start: float, stop: float, seconds: float) -> None:
+    steps = max(1, int(seconds / 0.02))
+    for i in range(1, steps + 1):
+        effect.setOpacity(start + (stop - start) * (i / steps))
+        QApplication.processEvents()
+        time.sleep(0.02)
+
+
+def _load_splash_music(photo_seconds: float):
+    """Decode the splash music (photo duration + fade tail) into PCM up-front.
+
+    Returns (audio, rate, device) or (None, None, None).
+    """
+    music_path = _find_splash_music()
+    if not music_path:
+        return None, None, None
+    device = _pick_output_device_index()
+    sample_rate = 44100
+    if device is not None:
+        try:
+            import sounddevice as sd
+            sr = sd.query_devices()[device].get("default_samplerate")
+            if sr:
+                sample_rate = int(float(sr))
+        except Exception:
+            pass
+    _music_tail = 5.0
+    audio, rate = _decode_splash_music(
+        music_path, seconds=photo_seconds + _music_tail,
+        sample_rate=sample_rate, volume=0.4,
+    )
+    if audio is None:
+        return None, None, None
+    _apply_fade_out(audio, rate, _music_tail)
+    return audio, rate, device
+
+
+def _show_startup_splash(image_path: str, seconds: float = 7.0, music=None) -> None:
+    """Show the startup photo fullscreen with fade-in/out; music fades into JARVIS.
+
+    ``music`` is the pre-loaded (audio, rate, device) tuple from
+    _load_splash_music, so the photo can cross-fade into an already-shown main
+    window with no blank gap in between.
+    """
+    if not image_path or not Path(image_path).exists():
+        return
+
+    audio, rate, device = music if music else (None, None, None)
+
+    try:
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        import sounddevice as sd
+
+        pm = QPixmap(image_path)
+        if pm.isNull():
+            return
+
+        # Start music (non-blocking) — sounddevice plays on its own thread,
+        # so it can't deadlock the fade loop the way Qt Multimedia/FFmpeg did.
+        if audio is not None and rate is not None:
+            try:
+                sd.play(audio, rate, device=device)
+            except Exception as e:
+                print(f"[UI] music play failed: {e}")
+                audio = None
+
+        splash = QLabel()
+        splash.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.SplashScreen
+        )
+        splash.setStyleSheet("background: black;")
+        splash.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scr = QApplication.primaryScreen().availableGeometry()
+        splash.setPixmap(pm.scaled(
+            scr.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+
+        effect = QGraphicsOpacityEffect(splash)
+        splash.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+
+        splash.showFullScreen()
+
+        fade_in, fade_out = 1.5, 1.5
+        hold = max(0.0, seconds - fade_in - fade_out)
+        _fade_opacity(effect, 0.0, 1.0, fade_in)
+        if hold > 0:
+            _wait_ui(hold)
+        _fade_opacity(effect, 1.0, 0.0, fade_out)
+
+        splash.close()
+        # Music continues on its own — the decoded tail fades out over ~5s
+        # while JARVIS is already visible underneath.
+    except Exception as e:
+        print(f"[UI] startup splash failed: {e}")
+        if audio is not None:
+            try:
+                import sounddevice as sd
+                sd.stop()
+            except Exception:
+                pass
+
+
 class JarvisUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
@@ -3222,8 +3446,18 @@ class JarvisUI:
         if ico.exists():
             self._app.setWindowIcon(QIcon(str(ico)))
 
+        # Load music + build + show the main window BEFORE the splash, so the
+        # photo cross-fades straight into JARVIS with no blank gap in between.
+        music = _load_splash_music(photo_seconds=7.0)
+
         self._win = MainWindow(face_path)
         self._win.showFullScreen()
+
+        _splash = BASE_DIR / "splash.png"
+        if not _splash.exists():
+            _splash = BASE_DIR / "face.png"
+        _show_startup_splash(str(_splash) if _splash.exists() else "", seconds=7.0, music=music)
+
         self.root = _RootShim(self._app)
 
     @property

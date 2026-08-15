@@ -27,6 +27,15 @@ import time
 import json
 import sys
 import traceback
+
+# Prevent UnicodeEncodeError on Windows consoles using cp1251/cp866: emoji and
+# other non-ASCII in print() must never crash the app. Replace unencodable chars.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 from datetime import datetime
 from pathlib import Path
 
@@ -1499,7 +1508,8 @@ class JarvisLive:
 
         p1 = (
             f"Greet the user warmly and mention it is {time_str}. "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
+            f"Then ask how you can help, e.g. 'Чем могу помочь?'. "
+            f"Keep it to 3 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
         )
 
         if self._turn_done_event:
@@ -1864,7 +1874,10 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
-    ui = JarvisUI("face.png")
+    # Resolve the face image relative to the script, not the launch directory,
+    # so the startup face appears no matter where JARVIS is started from.
+    _face = BASE_DIR / "face.png"
+    ui = JarvisUI(str(_face) if _face.exists() else "face.png")
 
     def runner():
         ui.wait_for_api_key()
