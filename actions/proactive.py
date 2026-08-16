@@ -2,6 +2,8 @@
 ProactiveEngine 2.0 — context-aware, time-aware, non-repetitive background prompting.
 Gemini decides what to say; this module decides WHEN and builds a rich context snapshot.
 """
+from __future__ import annotations
+
 import time
 from datetime import datetime
 

@@ -7,6 +7,8 @@ CryptoJS is auto-downloaded once and served locally — no CDN needed after that
 
 Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 """
+from __future__ import annotations
+
 
 import asyncio
 import base64

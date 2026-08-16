@@ -2,6 +2,8 @@
 System Monitor — background metric checks with voice alert support.
 Zero subprocess calls on all platforms — uses ctypes/pynvml/psutil/wmi only.
 """
+from __future__ import annotations
+
 import ctypes
 import platform
 import time

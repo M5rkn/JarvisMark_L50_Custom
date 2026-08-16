@@ -4,6 +4,8 @@ Speech-to-Text engines for MARK XL.
 Whisper  – offline transcription via faster-whisper (VAD-buffered)
 Vosk     – offline streaming transcription (lighter)
 """
+from __future__ import annotations
+
 import json
 import numpy as np
 

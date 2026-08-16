@@ -16,6 +16,8 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
         Note: tool-calling support depends on the model; use a model that
         supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
 """
+from __future__ import annotations
+
 import json
 import re
 import subprocess
