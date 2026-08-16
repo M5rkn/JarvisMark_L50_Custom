@@ -81,24 +81,11 @@ Memory is now organised into four persistent layers, each stored separately unde
 
 JARVIS decides what to remember and **searches by meaning, not just keywords** — using Gemini `text-embedding-004` for semantic matching (with an automatic dependency-free lexical fallback). Near-duplicates are merged automatically, and newer facts overwrite stale ones, so memory stays clean without manual cleanup. Everything survives restarts and works alongside the existing flat `long_term.json` store.
 
----
-
-## 🗺️ Mark Roadmap
-
-| Mark | Focus |
-|---|---|
-| **XLVIII** | Instant interrupt · parallel news · two-phase briefing · exponential backoff · vision cooldown |
-| **XLIX** | Auto-start · clipboard intelligence · assistant customization |
-| **L** | Session memory · background monitoring · proactive 2.0 · instant vision · parallel news search |
-| **LI+** | Plugin system · email · quiz mode · calorie counter · calendar |
-
----
-
 ## ⚡ Quick Start
 
 ```bash
-git clone https://github.com/FatihMakes/Mark-L.git
-cd Mark-L
+https://github.com/M5rkn/JarvisMark_L50_Custom
+cd JarvisMark_L50_Custom
 pip install -r requirements.txt
 python main.py
 ```
@@ -177,12 +164,4 @@ JARVIS is now built from **isolated, dynamically loadable skills**. Each skill d
 - **Create on demand** — say *"JARVIS, add Spotify control"* and JARVIS generates the skill via Gemini, installs its dependencies safely, tests it, and registers it — then *"Play my playlist"* just works.
 - **Safe failure** — a skill that fails three times in a row is auto-quarantined; disabling/removing a broken skill never affects the others.
 
----
-
-## ⚠️ License
-
-Personal and non-commercial use only.
-Licensed under **[Creative Commons BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)**.
-
----
-
+    
