@@ -3908,7 +3908,6 @@ def _show_startup_splash(image_path: str, seconds: float = _SPLASH_TOTAL, music=
     audio, rate, device = music if music else (None, None, None)
 
     try:
-        from PyQt6.QtWidgets import QGraphicsOpacityEffect
         import sounddevice as sd
 
         pm = QPixmap(image_path)
@@ -3917,36 +3916,43 @@ def _show_startup_splash(image_path: str, seconds: float = _SPLASH_TOTAL, music=
 
         # Music plays on sounddevice's own thread — non-blocking, so it can't
         # deadlock the animation loop the way Qt Multimedia/FFmpeg once did.
+        # A large blocksize makes playback tolerant of the CPU spikes the
+        # splash animation causes (prevents audio underruns / stutter).
         if audio is not None and rate is not None:
             try:
-                sd.play(audio, rate, device=device)
+                sd.play(audio, rate, device=device, blocksize=4096)
             except Exception as e:
-                print(f"[UI] music play failed: {e}")
-                audio = None
+                print(f"[UI] music play failed with blocksize: {e}")
+                try:
+                    sd.play(audio, rate, device=device)
+                except Exception as e2:
+                    print(f"[UI] music play failed: {e2}")
+                    audio = None
 
         splash = _CinematicSplash(pm)
 
-        effect = QGraphicsOpacityEffect(splash)
-        splash.setGraphicsEffect(effect)
-        effect.setOpacity(0.0)
+        # Window-level opacity (not QGraphicsOpacityEffect) — the fade is done
+        # by the OS compositor, so there's no fullscreen offscreen render every
+        # frame. That keeps the splash light and the music glitch-free.
+        splash.setWindowOpacity(0.0)
 
         splash.showFullScreen()
 
-        # Drive the animation on the main thread (pumping events), ~60 fps.
+        # Drive the animation on the main thread (pumping events), ~40 fps.
         total = max(0.5, float(seconds))
         start = time.time()
-        frame = 1.0 / 60.0
+        frame = 1.0 / 40.0
         while True:
             elapsed = time.time() - start
             if elapsed >= total:
                 splash.set_time(total)
-                effect.setOpacity(0.0)
+                splash.setWindowOpacity(0.0)
                 splash.update()
                 QApplication.processEvents()
                 break
 
             splash.set_time(elapsed)
-            effect.setOpacity(_splash_window_alpha(elapsed, total))
+            splash.setWindowOpacity(_splash_window_alpha(elapsed, total))
             splash.update()
             QApplication.processEvents()
             time.sleep(frame)
