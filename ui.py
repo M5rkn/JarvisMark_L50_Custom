@@ -41,8 +41,8 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
-    QRadialGradient, QShortcut,
+    QFontMetrics, QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath,
+    QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -591,6 +591,16 @@ class JarvisCore(QWidget):
         self._tmr.timeout.connect(self._step)
         self._tmr.start(80)
 
+    def pause_animation(self) -> None:
+        """Freeze the neural-core animation (used during the startup splash)."""
+        self._tmr.stop()
+
+    def resume_animation(self) -> None:
+        """Restart the neural-core animation after it was paused."""
+        if not self._tmr.isActive():
+            self._last_t = time.time()
+            self._tmr.start()
+
     def _load_face(self, path: str):
         try:
             from PIL import Image, ImageDraw
@@ -990,7 +1000,7 @@ class CommandBar(QWidget):
 
         self.volume = QSlider(Qt.Orientation.Horizontal)
         self.volume.setRange(0, 100)
-        self.volume.setValue(100)
+        self.volume.setValue(50)
         self.volume.setFixedWidth(90)
         self.volume.setStyleSheet(f"""
             QSlider::groove:horizontal {{
@@ -2081,7 +2091,7 @@ class MainWindow(QMainWindow):
         self.on_remote_clicked = None
         self.on_interrupt      = None
         self._muted            = False
-        self._voice_volume     = 1.0
+        self._voice_volume     = 0.5
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
@@ -3619,21 +3629,6 @@ def _apply_fade_out(audio, sample_rate: int, fade_seconds: float) -> None:
     audio[-n:] = audio[-n:] * ramp
 
 
-def _wait_ui(seconds: float) -> None:
-    end = time.time() + seconds
-    while time.time() < end:
-        QApplication.processEvents()
-        time.sleep(0.02)
-
-
-def _fade_opacity(effect, start: float, stop: float, seconds: float) -> None:
-    steps = max(1, int(seconds / 0.02))
-    for i in range(1, steps + 1):
-        effect.setOpacity(start + (stop - start) * (i / steps))
-        QApplication.processEvents()
-        time.sleep(0.02)
-
-
 def _load_splash_music(photo_seconds: float):
     """Decode the splash music (photo duration + fade tail) into PCM up-front.
 
@@ -3663,12 +3658,249 @@ def _load_splash_music(photo_seconds: float):
     return audio, rate, device
 
 
-def _show_startup_splash(image_path: str, seconds: float = 7.0, music=None) -> None:
-    """Show the startup photo fullscreen with fade-in/out; music fades into JARVIS.
+# ══════════════════════════════════════════════════════════════════════════════
+#  Cinematic startup splash
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SPLASH_TOTAL    = 7.0   # full cinematic boot duration, seconds
+_SPLASH_FADE_IN  = 1.0   # window fade-in
+_SPLASH_FADE_OUT = 1.0   # window fade-out (reveals the main window underneath)
+
+# Boot log shown in order — kept verbatim from the design spec.
+_SPLASH_BOOT_LINES = (
+    "INITIALIZING J.A.R.V.I.S.",
+    "NEURAL CORE — ONLINE",
+    "VOICE SYSTEM — ONLINE",
+    "MEMORY — ONLINE",
+    "SYSTEM CONTROL — ONLINE",
+)
+
+
+def _smoothstep(k: float) -> float:
+    k = max(0.0, min(1.0, k))
+    return k * k * (3.0 - 2.0 * k)
+
+
+def _splash_window_alpha(elapsed: float, total: float) -> float:
+    if elapsed < _SPLASH_FADE_IN:
+        return _smoothstep(elapsed / _SPLASH_FADE_IN)
+    hold_end = total - _SPLASH_FADE_OUT
+    if elapsed < hold_end:
+        return 1.0
+    k = (elapsed - hold_end) / _SPLASH_FADE_OUT
+    return 1.0 - _smoothstep(k)
+
+
+class _CinematicSplash(QWidget):
+    """Fullscreen boot overlay: Tony Stark image + blue/cyan HUD + boot log.
+
+    The window-level fade is driven externally (QGraphicsOpacityEffect) so the
+    splash can cross-fade into the already-visible main window. Everything else
+    (Ken Burns zoom, parallax, scanlines, particles, reticle, boot text) is
+    painted here against a monotonic clock set via ``set_time``.
+    """
+
+    def __init__(self, pixmap: QPixmap):
+        super().__init__()
+        self._t = 0.0
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.SplashScreen
+        )
+        self.setStyleSheet("background: #05080c;")
+
+        # Cover-scale the photo once so per-frame drawing is a cheap blit.
+        scr = QApplication.primaryScreen().size()
+        if not pixmap.isNull() and pixmap.width() > 0 and pixmap.height() > 0:
+            s = max(scr.width() / pixmap.width(), scr.height() / pixmap.height())
+            self._cover = pixmap.scaled(
+                max(1, int(pixmap.width() * s)),
+                max(1, int(pixmap.height() * s)),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        else:
+            self._cover = QPixmap(scr)
+            self._cover.fill(QColor("#05080c"))
+
+        # Deterministic drifting particles (fixed seed → stable across frames).
+        rng = random.Random(20260817)
+        self._particles = [
+            (rng.random(), rng.random(), rng.uniform(0.4, 1.6), rng.uniform(0.6, 1.8))
+            for _ in range(64)
+        ]
+
+        self._title_font = QFont(_UI_FONT, 30, QFont.Weight.Bold)
+        self._title_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
+        self._mono_font  = QFont(_MONO_FONT, 11)
+        self._mono_small = QFont(_MONO_FONT, 9)
+
+    def set_time(self, t: float) -> None:
+        self._t = max(0.0, float(t))
+
+    def _boot_line_alpha(self, index: int) -> float:
+        start  = _SPLASH_FADE_IN * 0.5 + index * 0.5
+        reveal = 0.35
+        t = self._t - start
+        if t <= 0.0:
+            return 0.0
+        return min(1.0, t / reveal)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            p.end()
+            return
+        cx, cy = w / 2.0, h / 2.0
+        t = self._t
+        margin = 24
+
+        # 1) Tony Stark image — subtle zoom + slow parallax drift.
+        zoom = 1.0 + 0.07 * _smoothstep(min(1.0, t / _SPLASH_TOTAL))
+        drift_x = math.sin(t * 0.55) * 12.0
+        drift_y = math.cos(t * 0.42) * 9.0
+        dw = self._cover.width() * zoom
+        dh = self._cover.height() * zoom
+        p.drawPixmap(
+            QRectF(cx - dw / 2.0 + drift_x, cy - dh / 2.0 + drift_y, dw, dh),
+            self._cover,
+            QRectF(self._cover.rect()),
+        )
+
+        # 2) Vignette — darken edges so the face stays the focal point.
+        vig = QRadialGradient(QPointF(cx, cy), max(w, h) * 0.72)
+        vig.setColorAt(0.0, QColor(0, 0, 0, 0))
+        vig.setColorAt(0.65, QColor(0, 0, 0, 40))
+        vig.setColorAt(1.0, QColor(0, 0, 0, 200))
+        p.fillRect(self.rect(), QBrush(vig))
+
+        # 3) CRT scanlines.
+        p.save()
+        p.setPen(QPen(QColor(120, 200, 255, 32), 1))
+        spacing = 4
+        y = int(t * 26.0) % spacing
+        while y < h:
+            p.drawLine(0, y, w, y)
+            y += spacing
+        p.restore()
+
+        # 4) Bright sweep band moving down the screen.
+        p.save()
+        frac = (t * 0.22) % 1.0
+        band_cy = frac * h
+        band = max(24.0, h * 0.10)
+        band_g = QLinearGradient(0, band_cy - band, 0, band_cy + band)
+        band_g.setColorAt(0.0, QColor(110, 210, 255, 0))
+        band_g.setColorAt(0.5, QColor(110, 210, 255, 46))
+        band_g.setColorAt(1.0, QColor(110, 210, 255, 0))
+        p.fillRect(0, int(band_cy - band), w, int(band * 2.0), QBrush(band_g))
+        p.restore()
+
+        # 5) Drifting particles.
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        for (px, py, spd, sz) in self._particles:
+            x = (px + t * spd * 0.03) % 1.0
+            y = (py - t * spd * 0.07) % 1.0
+            r = sz * 1.6
+            a = int(90 + 90 * math.sin(t * 2.0 + px * 40.0))
+            p.setBrush(QColor(120, 215, 255, max(0, a)))
+            p.drawEllipse(QPointF(x * w, y * h), r, r)
+        p.restore()
+
+        # 6) Corner brackets.
+        p.save()
+        p.setPen(QPen(QColor(62, 200, 255, 150), 2))
+        L = 44
+        for sx, sy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+            x0 = margin if sx > 0 else w - margin
+            y0 = margin if sy > 0 else h - margin
+            p.drawLine(x0, y0 + sy * L, x0, y0)
+            p.drawLine(x0, y0, x0 + sx * L, y0)
+        p.restore()
+
+        # 7) Rotating reticle (bottom-right).
+        p.save()
+        rc = QPointF(w - 118.0, h - 118.0)
+        R = 64.0
+        p.setPen(QPen(QColor(62, 200, 255, 130), 1))
+        p.drawEllipse(rc, R, R)
+        p.drawEllipse(rc, R * 0.62, R * 0.62)
+        p.drawEllipse(rc, R * 0.30, R * 0.30)
+        for i in range(12):
+            ang = i * math.pi / 6.0 + t * 0.35
+            c, s = math.cos(ang), math.sin(ang)
+            p.drawLine(
+                QPointF(rc.x() + c * (R - 4.0), rc.y() + s * (R - 4.0)),
+                QPointF(rc.x() + c * (R + 5.0), rc.y() + s * (R + 5.0)),
+            )
+        p.setPen(QPen(QColor(120, 220, 255, 190), 2))
+        p.drawArc(
+            QRectF(rc.x() - R, rc.y() - R, R * 2.0, R * 2.0),
+            int(-t * 140.0 * 16), int(58 * 16),
+        )
+        p.restore()
+
+        # 8) Title block.
+        p.save()
+        p.setFont(self._title_font)
+        p.setPen(QColor(210, 240, 255, 235))
+        p.drawText(QRectF(margin, 36, w - margin * 2, 40),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "J.A.R.V.I.S.")
+        p.setFont(self._mono_small)
+        p.setPen(QColor(120, 200, 235, 170))
+        p.drawText(QRectF(margin + 4, 76, w - margin * 2, 16),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "STARK INDUSTRIES  //  SYSTEM BOOT")
+        p.restore()
+
+        # 9) Boot log (bottom-left).
+        p.save()
+        p.setFont(self._mono_font)
+        line_h = 22
+        block_h = len(_SPLASH_BOOT_LINES) * line_h
+        block_top = h - margin - 18 - block_h
+        fm = QFontMetrics(self._mono_font)
+        for i, text in enumerate(_SPLASH_BOOT_LINES):
+            a = self._boot_line_alpha(i)
+            if a <= 0.0:
+                continue
+            cy_line = block_top + i * line_h + line_h / 2.0
+            p.setOpacity(a)
+            dot = QColor(62, 200, 255) if i == 0 else QColor(61, 220, 151)
+            p.setBrush(dot)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(margin + 8, cy_line), 3, 3)
+            p.setPen(QColor(205, 238, 250, 225))
+            p.drawText(QRectF(margin + 20, cy_line - line_h / 2.0, w - margin, line_h),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       text)
+            if i == 0 and self._boot_line_alpha(0) >= 1.0:
+                blink = 0.5 + 0.5 * math.sin(t * 6.0)
+                if blink > 0.0:
+                    p.setOpacity(blink)
+                    p.setBrush(QColor(62, 200, 255))
+                    p.setPen(Qt.PenStyle.NoPen)
+                    tw = fm.horizontalAdvance(text)
+                    p.drawRect(int(margin + 20 + tw + 6), int(cy_line - 7), 7, 14)
+        p.restore()
+
+        p.end()
+
+
+def _show_startup_splash(image_path: str, seconds: float = _SPLASH_TOTAL, music=None) -> None:
+    """Cinematic boot: fullscreen Tony Stark photo + HUD, cross-fading into JARVIS.
 
     ``music`` is the pre-loaded (audio, rate, device) tuple from
-    _load_splash_music, so the photo can cross-fade into an already-shown main
-    window with no blank gap in between.
+    _load_splash_music. The main window is already shown underneath, so the
+    splash's fade-out reveals it with no blank gap.
     """
     if not image_path or not Path(image_path).exists():
         return
@@ -3683,8 +3915,8 @@ def _show_startup_splash(image_path: str, seconds: float = 7.0, music=None) -> N
         if pm.isNull():
             return
 
-        # Start music (non-blocking) — sounddevice plays on its own thread,
-        # so it can't deadlock the fade loop the way Qt Multimedia/FFmpeg did.
+        # Music plays on sounddevice's own thread — non-blocking, so it can't
+        # deadlock the animation loop the way Qt Multimedia/FFmpeg once did.
         if audio is not None and rate is not None:
             try:
                 sd.play(audio, rate, device=device)
@@ -3692,20 +3924,7 @@ def _show_startup_splash(image_path: str, seconds: float = 7.0, music=None) -> N
                 print(f"[UI] music play failed: {e}")
                 audio = None
 
-        splash = QLabel()
-        splash.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.SplashScreen
-        )
-        splash.setStyleSheet("background: black;")
-        splash.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        scr = QApplication.primaryScreen().availableGeometry()
-        splash.setPixmap(pm.scaled(
-            scr.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        ))
+        splash = _CinematicSplash(pm)
 
         effect = QGraphicsOpacityEffect(splash)
         splash.setGraphicsEffect(effect)
@@ -3713,15 +3932,29 @@ def _show_startup_splash(image_path: str, seconds: float = 7.0, music=None) -> N
 
         splash.showFullScreen()
 
-        fade_in, fade_out = 1.5, 1.5
-        hold = max(0.0, seconds - fade_in - fade_out)
-        _fade_opacity(effect, 0.0, 1.0, fade_in)
-        if hold > 0:
-            _wait_ui(hold)
-        _fade_opacity(effect, 1.0, 0.0, fade_out)
+        # Drive the animation on the main thread (pumping events), ~60 fps.
+        total = max(0.5, float(seconds))
+        start = time.time()
+        frame = 1.0 / 60.0
+        while True:
+            elapsed = time.time() - start
+            if elapsed >= total:
+                splash.set_time(total)
+                effect.setOpacity(0.0)
+                splash.update()
+                QApplication.processEvents()
+                break
+
+            splash.set_time(elapsed)
+            effect.setOpacity(_splash_window_alpha(elapsed, total))
+            splash.update()
+            QApplication.processEvents()
+            time.sleep(frame)
 
         splash.close()
-        # Music continues on its own — the decoded tail fades out over ~5s
+        splash.deleteLater()
+        QApplication.processEvents()
+        # Music keeps playing on its own — the decoded tail fades out over ~5s
         # while JARVIS is already visible underneath.
     except Exception as e:
         print(f"[UI] startup splash failed: {e}")
@@ -3752,15 +3985,28 @@ class JarvisUI:
 
         # Load music + build + show the main window BEFORE the splash, so the
         # photo cross-fades straight into JARVIS with no blank gap in between.
-        music = _load_splash_music(photo_seconds=7.0)
+        music = _load_splash_music(photo_seconds=_SPLASH_TOTAL)
 
         self._win = MainWindow(face_path)
         self._win.showFullScreen()
 
+        # Let the main window paint once (warm its render surface), then freeze
+        # the neural-core animation while the splash plays — otherwise JARVIS
+        # keeps repainting underneath the splash and the reveal stutters.
+        QApplication.processEvents()
+        self._win.core.pause_animation()
+
         _splash = BASE_DIR / "splash.png"
         if not _splash.exists():
             _splash = BASE_DIR / "face.png"
-        _show_startup_splash(str(_splash) if _splash.exists() else "", seconds=7.0, music=music)
+        _show_startup_splash(str(_splash) if _splash.exists() else "", seconds=_SPLASH_TOTAL, music=music)
+
+        # Hand the screen back to JARVIS: resume the core animation and present
+        # the window immediately so the splash→GUI transition is smooth.
+        self._win.core.resume_animation()
+        self._win.raise_()
+        self._win.activateWindow()
+        QApplication.processEvents()
 
         self.root = _RootShim(self._app)
 

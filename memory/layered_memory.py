@@ -253,6 +253,34 @@ def _merge_into(existing: dict, content: str, labels: list[str] | None,
     existing["embedding"] = None   # re-embed next pass (content changed)
 
 
+# Keys that legitimately hold several values at once (e.g. a bilingual user's
+# "language" is Russian AND English). These must never be collapsed by the
+# singleton-fact upsert below — only exact lexical dedup applies to them.
+_MULTI_VALUE_KEYS = {"language", "languages"}
+
+
+def _same_fact_key(in_content: str, in_labels, entry: dict) -> bool:
+    """True when ``entry`` stores a "key: value" fact whose key label matches one
+    of ``in_labels`` and the incoming content is an updated value for that key.
+
+    This lets a mutable singleton fact (e.g. "age: 19" → "age: 20") be replaced
+    by a newer value instead of piling up conflicting entries that lexical dedup
+    would never merge (different values ⇒ different text). Multi-valued keys
+    (see ``_MULTI_VALUE_KEYS``) are deliberately excluded.
+    """
+    inc = {str(l).strip().lower() for l in (in_labels or [])}
+    ent = {str(l).strip().lower() for l in entry.get("labels", [])}
+    etext = (entry.get("content") or "").lower()
+    itext = (in_content or "").lower()
+    for lab in inc & ent:
+        key = lab.replace("_", " ")
+        if key in _MULTI_VALUE_KEYS:
+            continue
+        if key and f"{key}:" in etext and f"{key}:" in itext:
+            return True
+    return False
+
+
 # ── Public write API ───────────────────────────────────────────────────────────
 
 def add_memory(content: str, layer: str = LONG_TERM, labels: list[str] | None = None,
@@ -295,6 +323,15 @@ def add_memory(content: str, layer: str = LONG_TERM, labels: list[str] | None = 
                     best = e
             if best is not None and best_score >= _LEX_DUP_THRESHOLD:
                 existing = best
+
+            # Mutable-fact upsert: re-saving "key: value" under the same key
+            # label (e.g. "language: Russian" → "language: English") replaces
+            # the old value instead of accumulating conflicting entries.
+            if existing is None and labels:
+                for e in entries:
+                    if _same_fact_key(content, labels, e):
+                        existing = e
+                        break
 
         if existing is not None:
             _merge_into(existing, content, labels, importance)

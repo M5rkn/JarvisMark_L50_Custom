@@ -27,47 +27,73 @@ def _is_safe_path(target: Path) -> bool:
     except Exception:
         return False
 
-def _get_desktop() -> Path:
+_WINDOWS_FOLDER_KEYS = {
+    "Desktop":   "Desktop",
+    "Documents": "Personal",
+    "Downloads": "{374DE290-123F-4565-9164-39C4925E467B}",
+    "Pictures":  "My Pictures",
+    "Music":     "My Music",
+    "Videos":    "My Video",
+}
+
+
+def _windows_known_folder(name: str) -> Path | None:
+    """Resolve a Windows known folder via the registry.
+
+    Handles OneDrive-redirected and localized systems, where the on-disk path
+    differs from the naive ``Path.home() / "Desktop"`` guess. Returns None when
+    the lookup fails so callers fall back to the home-directory default.
+    """
+    if _OS != "Windows":
+        return None
+    key_name = _WINDOWS_FOLDER_KEYS.get(name)
+    if not key_name:
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, key_name)
+        if value:
+            path = Path(os.path.expandvars(str(value)))
+            if path.exists():
+                return path
+    except Exception:
+        pass
+    return None
+
+
+def _known_dir(name: str, linux_env: str, fallback: str) -> Path:
     if _OS == "Linux":
-        xdg = os.environ.get("XDG_DESKTOP_DIR", "")
+        xdg = os.environ.get(linux_env, "")
         if xdg and Path(xdg).exists():
             return Path(xdg)
-    return Path.home() / "Desktop"
+    if _OS == "Windows":
+        resolved = _windows_known_folder(name)
+        if resolved:
+            return resolved
+    return Path.home() / fallback
+
+
+def _get_desktop() -> Path:
+    return _known_dir("Desktop", "XDG_DESKTOP_DIR", "Desktop")
 
 def _get_downloads() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOWNLOAD_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Downloads"
+    return _known_dir("Downloads", "XDG_DOWNLOAD_DIR", "Downloads")
 
 def _get_documents() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOCUMENTS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Documents"
+    return _known_dir("Documents", "XDG_DOCUMENTS_DIR", "Documents")
 
 def _get_pictures() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_PICTURES_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Pictures"
+    return _known_dir("Pictures", "XDG_PICTURES_DIR", "Pictures")
 
 def _get_music() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_MUSIC_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Music"
+    return _known_dir("Music", "XDG_MUSIC_DIR", "Music")
 
 def _get_videos() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_VIDEOS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Videos"
+    return _known_dir("Videos", "XDG_VIDEOS_DIR", "Videos")
 
 
 def _resolve_path(raw: str) -> Path:
@@ -136,6 +162,8 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
 
 
 def create_file(path: str, name: str = "", content: str = "") -> str:
+    if not name or not name.strip():
+        return "No file name provided — please specify the file name."
     try:
         base   = _resolve_path(path)
         target = (base / name) if name else base
@@ -149,6 +177,8 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
 
 
 def create_folder(path: str, name: str = "") -> str:
+    if not name or not name.strip():
+        return "No folder name provided — please specify the folder name."
     try:
         base   = _resolve_path(path)
         target = (base / name) if name else base
@@ -302,7 +332,17 @@ def write_file(path: str, name: str = "", content: str = "",
 
 
 def find_files(name: str = "", extension: str = "",
-               path: str = "home", max_results: int = 20) -> str:
+               path: str = "home", max_results: int = 20,
+               find_type: str = "both") -> str:
+    """Search for files and/or folders by name (and, for files, extension)."""
+    find_type = (find_type or "both").lower().strip()
+    if find_type not in ("files", "folders", "both"):
+        find_type = "both"
+
+    ext = (extension or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+
     try:
         search_path = _resolve_path(path)
         if not _is_safe_path(search_path):
@@ -310,32 +350,40 @@ def find_files(name: str = "", extension: str = "",
         if not search_path.exists():
             return f"Search path not found: {path}"
 
-        results    = []
-        dir_count  = 0
-        max_dirs   = 500  # performans + güvenlik limiti
+        results   = []
+        dir_count = 0
+        max_dirs  = 500  # traversal guard (performance + safety)
 
         for item in search_path.rglob("*"):
             if item.is_dir():
                 dir_count += 1
                 if dir_count > max_dirs:
                     break
-                continue
-            if not item.is_file():
-                continue
-            if extension and item.suffix.lower() != extension.lower():
-                continue
-            if name and name.lower() not in item.name.lower():
-                continue
-            size = _format_size(item.stat().st_size)
-            results.append(f"📄 {item.name} ({size}) — {item.parent}")
+                if find_type in ("folders", "both"):
+                    if not name or name.lower() in item.name.lower():
+                        results.append(f"📁 {item.name}/ — {item.parent}")
+            else:
+                if find_type in ("files", "both"):
+                    if ext and item.suffix.lower() != ext:
+                        continue
+                    if name and name.lower() not in item.name.lower():
+                        continue
+                    size = _format_size(item.stat().st_size)
+                    results.append(f"📄 {item.name} ({size}) — {item.parent}")
             if len(results) >= max_results:
                 break
 
         if not results:
-            query = name or extension or "files"
+            if find_type == "both":
+                query = name or ext or "items"
+            elif find_type == "folders":
+                query = name or "folders"
+            else:
+                query = name or ext or "files"
             return f"No {query} found in {search_path.name}/"
 
-        return f"Found {len(results)} file(s):\n" + "\n".join(results)
+        kind = {"files": "file(s)", "folders": "folder(s)", "both": "item(s)"}[find_type]
+        return f"Found {len(results)} {kind}:\n" + "\n".join(results)
 
     except Exception as e:
         return f"Search error: {e}"
@@ -519,6 +567,7 @@ def file_controller(
                 extension=params.get("extension", ""),
                 path=path,
                 max_results=min(int(params.get("max_results", 20)), 50),
+                find_type=params.get("find_type", "both"),
             )
 
         elif action == "largest":

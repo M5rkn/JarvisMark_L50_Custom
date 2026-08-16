@@ -1,11 +1,4 @@
-# ⚙️ MARK L (50)
-### The Ultimate Cross-Platform Personal AI Assistant — By FatihMakes
 
-> 📺 **[Watch the full setup video on YouTube](https://www.youtube.com/@FatihMakes)**
-
-A real-time voice AI that can hear, see, understand, and control your computer — on any OS. Supports Windows, macOS, and Linux. Built on the Gemini Live API for native audio streaming, delivering zero subscriptions and total digital autonomy.
-
----
 
 ## ✨ Overview
 
@@ -89,18 +82,7 @@ Memory is now organised into four persistent layers, each stored separately unde
 
 JARVIS decides what to remember and **searches by meaning, not just keywords** — using Gemini `text-embedding-004` for semantic matching (with an automatic dependency-free lexical fallback). Near-duplicates are merged automatically, and newer facts overwrite stale ones, so memory stays clean without manual cleanup. Everything survives restarts and works alongside the existing flat `long_term.json` store.
 
----
 
-## 🗺️ Mark Roadmap
-
-| Mark | Focus |
-|---|---|
-| **XLVIII** | Instant interrupt · parallel news · two-phase briefing · exponential backoff · vision cooldown |
-| **XLIX** | Auto-start · clipboard intelligence · assistant customization |
-| **L** | Session memory · background monitoring · proactive 2.0 · instant vision · parallel news search |
-| **LI+** | Plugin system · email · quiz mode · calorie counter · calendar |
-
----
 
 ## ⚡ Quick Start
 
@@ -186,11 +168,3 @@ JARVIS is now built from **isolated, dynamically loadable skills**. Each skill d
 - **Safe failure** — a skill that fails three times in a row is auto-quarantined; disabling/removing a broken skill never affects the others.
 
 ---
-
-## ⚠️ License
-
-Personal and non-commercial use only.
-Licensed under **[Creative Commons BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)**.
-
----
-

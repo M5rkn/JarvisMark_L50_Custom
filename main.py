@@ -58,6 +58,8 @@ from actions.weather_report    import weather_action
 from actions.send_message      import send_message
 from actions.reminder          import reminder
 from actions.computer_settings import computer_settings
+from actions.work_mode        import work_mode, work_mode_off
+from actions.game_mode         import game_mode, game_mode_off
 from actions.screen_processor  import _capture_camera, _capture_screen
 from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
@@ -271,19 +273,75 @@ TOOL_DECLARATIONS = [
         "description": (
             "Controls the COMPUTER: volume, brightness, window management, keyboard shortcuts, "
             "typing text on screen, closing apps, fullscreen, dark mode, WiFi, "
-            "restarting the PC, shutting down the PC, "
+            "restarting the PC, shutting down the PC (immediately OR on a timer), cancelling a "
+            "scheduled shutdown, "
             "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
             "Use for ANY single computer control command (NOT for turning the assistant itself off)."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform. Volume actions: 'volume_set' (with value=0-100), 'volume_up', 'volume_down', 'mute', 'unmute'. Others: 'brightness_up', 'brightness_down', 'close_app', 'restart', 'shutdown', 'screenshot', 'type_text', 'press_key', 'dark_mode', 'toggle_wifi', 'lock_screen'."},
+                "action":      {"type": "STRING", "description": "The action to perform. Volume actions: 'volume_set' (with value=0-100), 'volume_up', 'volume_down', 'mute', 'unmute'. Others: 'brightness_up', 'brightness_down', 'close_app', 'restart', 'shutdown', 'cancel_shutdown', 'screenshot', 'type_text', 'press_key', 'dark_mode', 'toggle_wifi', 'lock_screen', 'show_desktop'. 'show_desktop' minimizes ALL open windows to reveal the desktop — use it when the user says 'show the desktop' / 'покажи рабочий стол' meaning reveal/minimize, NOT to list files. To shut down or restart AFTER a delay, use action='shutdown' or 'restart' and set delay_minutes to the number of minutes. To abort a scheduled shutdown/restart, use action='cancel_shutdown'."},
                 "description": {"type": "STRING", "description": "Natural language description of what to do (used when action is empty)"},
                 "value":       {"type": "STRING", "description": "Optional value. volume_set: integer 0-100. type_text: text to type. close_app: app name. press_key: key name."},
-                "app_name":    {"type": "STRING", "description": "Application name to close (close_app), e.g. 'Telegram', 'Discord', 'Steam'"}
+                "app_name":    {"type": "STRING", "description": "Application name to close (close_app), e.g. 'Telegram', 'Discord', 'Steam'"},
+                "delay_minutes": {"type": "INTEGER", "description": "Delay in minutes before shutting down or restarting (shutdown/restart actions). Omit or 0 for immediate."},
+                "confirmed":   {"type": "STRING", "description": "Set to 'yes' to confirm an IMMEDIATE shutdown or restart (required only when delay_minutes is 0 or omitted)."},
             },
             "required": []
+        }
+    },
+    {
+        "name": "work_mode",
+        "description": (
+            "Activates JARVIS's 'Work Mode' (рабочий режим). Call this when the user says "
+            "'work mode', 'рабочий режим', 'включи рабочий режим', 'запусти рабочий режим', "
+            "or asks to set up their work environment. It opens VS Code, opens Spotify in the "
+            "browser and resumes the last paused track, opens a terminal and types 'qwen', and "
+            "opens ChatGPT."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {}
+        }
+    },
+    {
+        "name": "work_mode_off",
+        "description": (
+            "Turns OFF JARVIS's 'Work Mode' (рабочий режим). Call this when the user says "
+            "'turn off work mode', 'stop work mode', 'выключи рабочий режим', 'закрой рабочий "
+            "режим', or wants to end their work environment. It closes everything Work Mode "
+            "opened: VS Code, the terminal, and the Spotify + ChatGPT browser tabs."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {}
+        }
+    },
+    {
+        "name": "game_mode",
+        "description": (
+            "Activates JARVIS's 'Game Mode' (игровой режим). Call this when the user says "
+            "'game mode', 'игровой режим', 'включи игровой режим', or asks to switch to gaming. "
+            "It first turns off Work Mode (closing VS Code, the terminal, and the Spotify + "
+            "ChatGPT tabs), then opens Steam, Discord, and Spotify."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {}
+        }
+    },
+    {
+        "name": "game_mode_off",
+        "description": (
+            "Turns OFF JARVIS's 'Game Mode' (игровой режим). Call this when the user says "
+            "'turn off game mode', 'stop game mode', 'выключи игровой режим', 'закрой игровой "
+            "режим', or wants to end their gaming session. It closes everything Game Mode "
+            "opened: Steam, Discord, and the Spotify browser tab."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {}
         }
     },
     {
@@ -337,17 +395,19 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "file_controller",
-        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+        "description": "Manages files and folders: list a folder's contents (e.g. the desktop), search/find files AND folders by name, create, delete, move, copy, rename, read, write, largest files, disk usage.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
-                "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
+                "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, pictures, music, videos, home"},
                 "destination": {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":    {"type": "STRING", "description": "New name for rename"},
                 "content":     {"type": "STRING", "description": "Content for create_file/write"},
-                "name":        {"type": "STRING", "description": "File name to search for"},
-                "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf)"},
+                "name":        {"type": "STRING", "description": "File or folder name to search for (find action)"},
+                "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf, .jpg) — files only"},
+                "find_type":   {"type": "STRING", "description": "What to search: files | folders | both (default: both)"},
+                "max_results": {"type": "INTEGER", "description": "Max search results (default: 20)"},
                 "count":       {"type": "INTEGER", "description": "Number of results for largest"},
             },
             "required": ["action"]
@@ -900,10 +960,13 @@ class JarvisLive:
         # Identity injection — overrides any hardcoded name in prompt.txt
         _addr = (f"ADDRESS: Address the user as 'Sir' / 'Сэр' (match the language you speak) — "
                  f"calm and respectful, like JARVIS addressing Mr. Stark. "
-                 f"Occasionally use their name '{_user_name}'. Never use 'efendim'."
+                 f"Occasionally use their name '{_user_name}'. "
+                 f"The user's name is exactly '{_user_name}' — NEVER invent, guess, or substitute "
+                 f"any other name for them. Never use 'efendim'."
                  if _user_name
                  else "ADDRESS: Address the user as 'Sir' / 'Сэр' (match the language you speak) — "
-                      "calm and respectful, like JARVIS addressing Mr. Stark. Never use 'efendim'.")
+                      "calm and respectful, like JARVIS addressing Mr. Stark. "
+                      "NEVER invent or guess a name for the user. Never use 'efendim'.")
         identity_ctx = (
             f"[IDENTITY]\n"
             f"Your name is {self._asst_name}. "
@@ -911,7 +974,26 @@ class JarvisLive:
             f"{_addr}\n\n"
         )
 
+        # Recent conversation context: carry the last few turns into the system
+        # prompt so a reconnect (or a fresh Gemini Live session) does not lose
+        # the immediate thread — e.g. what a pronoun like "it" / "her" refers to.
+        recent_ctx = ""
+        try:
+            recent_turns = list(getattr(self, "_session_log", [])[-8:])
+        except Exception:
+            recent_turns = []
+        if recent_turns:
+            recent_ctx = (
+                "[RECENT CONVERSATION — the last few turns, kept so an interrupted "
+                "session can pick up where it left off. Use this only as context for "
+                "resolving pronouns and references; do not re-answer or recite it.]\n"
+                + "\n".join(f"  {t}" for t in recent_turns)
+                + "\n\n"
+            )
+
         parts = [time_ctx, identity_ctx]
+        if recent_ctx:
+            parts.append(recent_ctx)
         if mem_str:
             parts.append(mem_str)
         if layered_str:
@@ -1140,6 +1222,22 @@ class JarvisLive:
             elif name == "computer_settings":
                 r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
                 result = r or "Done."
+
+            elif name == "work_mode":
+                r = await loop.run_in_executor(None, lambda: work_mode(parameters=args, player=self.ui))
+                result = r or "Work mode activated."
+
+            elif name == "work_mode_off":
+                r = await loop.run_in_executor(None, lambda: work_mode_off(parameters=args, player=self.ui))
+                result = r or "Work mode deactivated."
+
+            elif name == "game_mode":
+                r = await loop.run_in_executor(None, lambda: game_mode(parameters=args, player=self.ui))
+                result = r or "Game mode activated."
+
+            elif name == "game_mode_off":
+                r = await loop.run_in_executor(None, lambda: game_mode_off(parameters=args, player=self.ui))
+                result = r or "Game mode deactivated."
 
             elif name == "desktop_control":
                 r = await loop.run_in_executor(None, lambda: desktop_control(parameters=args, player=self.ui))

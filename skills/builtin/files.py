@@ -25,17 +25,19 @@ skill.permissions = ["filesystem"]
 skill.tools = [
     Tool(
         name="file_controller",
-        description="Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+        description="Manages files and folders: list a folder's contents (e.g. the desktop), search/find files AND folders by name, create, delete, move, copy, rename, read, write, largest files, disk usage.",
         parameters={
             "type": "OBJECT",
             "properties": {
                 "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
-                "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
+                "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, pictures, music, videos, home"},
                 "destination": {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":    {"type": "STRING", "description": "New name for rename"},
                 "content":     {"type": "STRING", "description": "Content for create_file/write"},
-                "name":        {"type": "STRING", "description": "File name to search for"},
-                "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf)"},
+                "name":        {"type": "STRING", "description": "File or folder name to search for (find action)"},
+                "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf, .jpg) — files only"},
+                "find_type":   {"type": "STRING", "description": "What to search: files | folders | both (default: both)"},
+                "max_results": {"type": "INTEGER", "description": "Max search results (default: 20)"},
                 "count":       {"type": "INTEGER", "description": "Number of results for largest"},
             },
             "required": ["action"],

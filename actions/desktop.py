@@ -33,6 +33,20 @@ def _get_desktop() -> Path:
         xdg = os.environ.get("XDG_DESKTOP_DIR", "")
         if xdg and Path(xdg).exists():
             return Path(xdg)
+    if _OS == "Windows":
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "Desktop")
+            if value:
+                path = Path(os.path.expandvars(str(value)))
+                if path.exists():
+                    return path
+        except Exception:
+            pass
     return Path.home() / "Desktop"
 
 def _build_sandbox() -> dict:

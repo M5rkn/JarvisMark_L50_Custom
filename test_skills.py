@@ -64,8 +64,8 @@ def main() -> int:
 
     print("\n== built-in skills ==")
     builtin = sorted(manager.registry._builtin.keys())
-    expected = {"browser", "coding", "files", "youtube", "telegram", "system", "research", "finance", "media"}
-    check("9 built-in skills registered", builtin == sorted(expected), str(builtin))
+    expected = {"browser", "coding", "downloads", "files", "youtube", "telegram", "system", "research", "finance", "media"}
+    check("10 built-in skills registered", builtin == sorted(expected), str(builtin))
 
     print("\n== tool declarations ==")
     decls = manager.tool_declarations()

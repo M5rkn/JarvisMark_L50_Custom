@@ -446,6 +446,11 @@ def _kill_pids(pids: list[int]) -> bool:
     if not pids:
         return False
 
+    # Never kill JARVIS itself or its own process tree (including the terminal
+    # or shell that launched it) — killing a parent takes JARVIS down too.
+    protected = _protected_pids()
+    pids = [p for p in pids if p not in protected]
+
     killed_any = False
     target_pids = set(pids)
 
@@ -547,8 +552,15 @@ def _protected_pids() -> set[int]:
     if not _PSUTIL:
         return protected
     try:
-        for child in psutil.Process(os.getpid()).children(recursive=True):
+        me = psutil.Process(os.getpid())
+        for child in me.children(recursive=True):
             protected.add(child.pid)
+        # Also protect the whole ancestor chain (the terminal/shell that
+        # launched JARVIS). Closing a parent process would kill JARVIS too.
+        parent = me.parent()
+        while parent is not None:
+            protected.add(parent.pid)
+            parent = parent.parent()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
     return protected
@@ -660,6 +672,8 @@ def _close_app_by_name(app_name: str) -> bool:
             before_pid = _get_foreground_pid_windows()
             if before_pid and _is_browser_pid(before_pid):
                 continue  # don't Alt+F4 a browser just because a tab matched
+            if before_pid and before_pid in _protected_pids():
+                continue  # never Alt+F4 JARVIS or the terminal it runs in
             time.sleep(0.4)
             if _OS == "Darwin":
                 pyautogui.hotkey("command", "q")
@@ -684,6 +698,10 @@ def close_app(app_name: str | None = None) -> str:
 
     if _close_foreground_app():
         return "Closed active window."
+    # Don't fall through to a blind Alt+F4 if the foreground window belongs to
+    # JARVIS itself or to the terminal that launched it.
+    if _get_foreground_pid_windows() in _protected_pids():
+        return "Active window is JARVIS or its terminal; not closing."
     if _OS == "Darwin":
         pyautogui.hotkey("command", "q")
     else:
@@ -1014,25 +1032,48 @@ def toggle_wifi():
         except Exception as e:
             print(f"[Settings] toggle_wifi Linux failed: {e}")
 
-def restart_computer():
+def restart_computer(delay_seconds: int = 0):
+    delay = max(0, int(delay_seconds))
     if _OS == "Windows":
-        subprocess.run(["shutdown", "/r", "/t", "10"], capture_output=True, **_WIN_HIDE)
+        subprocess.run(["shutdown", "/r", "/t", str(delay)], capture_output=True, **_WIN_HIDE)
     elif _OS == "Darwin":
-        subprocess.run(["osascript", "-e",
-            'tell application "System Events" to restart'],
-            capture_output=True)
+        if delay > 0:
+            subprocess.run(["shutdown", "-r", f"+{max(1, delay // 60)}"], capture_output=True)
+        else:
+            subprocess.run(["osascript", "-e",
+                'tell application "System Events" to restart'],
+                capture_output=True)
     else:
-        subprocess.run(["systemctl", "reboot"], capture_output=True)
+        if delay > 0:
+            subprocess.run(["shutdown", "-r", f"+{max(1, delay // 60)}"], capture_output=True)
+        else:
+            subprocess.run(["systemctl", "reboot"], capture_output=True)
 
-def shutdown_computer():
+def shutdown_computer(delay_seconds: int = 0):
+    delay = max(0, int(delay_seconds))
     if _OS == "Windows":
-        subprocess.run(["shutdown", "/s", "/t", "10"], capture_output=True)
+        subprocess.run(["shutdown", "/s", "/t", str(delay)], capture_output=True, **_WIN_HIDE)
     elif _OS == "Darwin":
-        subprocess.run(["osascript", "-e",
-            'tell application "System Events" to shut down'],
-            capture_output=True)
+        if delay > 0:
+            subprocess.run(["shutdown", "-h", f"+{max(1, delay // 60)}"], capture_output=True)
+        else:
+            subprocess.run(["osascript", "-e",
+                'tell application "System Events" to shut down'],
+                capture_output=True)
     else:
-        subprocess.run(["systemctl", "poweroff"], capture_output=True)
+        if delay > 0:
+            subprocess.run(["shutdown", "-h", f"+{max(1, delay // 60)}"], capture_output=True)
+        else:
+            subprocess.run(["systemctl", "poweroff"], capture_output=True)
+
+def cancel_shutdown():
+    """Abort any pending shutdown/restart scheduled on this machine."""
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/a"], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["sudo", "-n", "killall", "shutdown"], capture_output=True)
+    else:
+        subprocess.run(["shutdown", "-c"], capture_output=True)
 
 ACTION_MAP: dict[str, callable] = {
     "volume_up":           volume_up,
@@ -1094,9 +1135,9 @@ ACTION_MAP: dict[str, callable] = {
     "toggle_wifi":         toggle_wifi,
     "restart":             restart_computer,
     "shutdown":            shutdown_computer,
+    "cancel_shutdown":     cancel_shutdown,
+    "abort_shutdown":      cancel_shutdown,
 }
-
-_DANGEROUS_ACTIONS = {"restart", "shutdown"}
 
 
 
@@ -1106,7 +1147,8 @@ def _detect_action(description: str) -> dict:
     _client = _genai.Client(api_key=_get_api_key())
 
     available = ", ".join(sorted(ACTION_MAP.keys())) + \
-                ", volume_set, type_text, press_key, reload_n"
+                ", volume_set, type_text, press_key, reload_n, " \
+                "schedule_shutdown, shutdown_in, restart_in"
 
     prompt = f"""You are an intent detector for a computer control assistant.
 
@@ -1134,6 +1176,48 @@ Rules:
     except Exception as e:
         print(f"[Settings] Intent detection failed: {e}")
         return {"action": description.lower().replace(" ", "_"), "value": None}
+
+
+def _parse_delay_minutes(params: dict, value, description: str) -> int:
+    """Extract a shutdown/restart delay in whole minutes.
+
+    Sources, in priority order: explicit ``delay_minutes`` / ``minutes`` params,
+    then ``delay_seconds`` (converted), then the numeric part of ``value`` or
+    ``description``. Words like "секунд"/"second" force seconds; "час"/"hour"
+    force hours; otherwise the number is treated as minutes.
+    """
+    for key in ("delay_minutes", "minutes"):
+        v = params.get(key)
+        if v is None:
+            continue
+        try:
+            return max(0, int(round(float(v))))
+        except (TypeError, ValueError):
+            pass
+
+    v = params.get("delay_seconds")
+    if v is not None:
+        try:
+            return max(0, int(round(float(v) / 60.0)))
+        except (TypeError, ValueError):
+            pass
+
+    raw = str(value if value is not None else description or "").strip()
+    m = re.search(r"(\d+(?:[.,]\d+)?)", raw)
+    if not m:
+        return 0
+    try:
+        num = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return 0
+
+    low = raw.lower()
+    if "секунд" in low or "second" in low or " sec" in low:
+        return max(0, int(round(num / 60.0)))
+    if "час" in low or "hour" in low:
+        return max(0, int(round(num * 60.0)))
+    return max(0, int(round(num)))
+
 
 def computer_settings(
     parameters: dict = None,
@@ -1164,13 +1248,39 @@ def computer_settings(
     if player:
         player.write_log(f"[Settings] {action}")
 
-    if action in _DANGEROUS_ACTIONS:
-        confirmed = str(params.get("confirmed", "")).lower()
-        if confirmed not in ("yes", "true", "1", "confirm"):
-            return (
-                f"This will {action} the computer. "
-                f"Please confirm by calling again with confirmed=yes."
-            )
+    # Power actions: shutdown / restart, with optional delay and cancellation.
+    if action in ("shutdown", "restart", "reboot", "schedule_shutdown",
+                  "shutdown_in", "restart_in", "poweroff"):
+        is_restart = action in ("restart", "reboot", "restart_in")
+        delay_minutes = _parse_delay_minutes(params, value, description)
+
+        # A delayed power action is reversible via cancel_shutdown, so it does
+        # not need the confirmation gate. An immediate one still does.
+        if delay_minutes <= 0:
+            confirmed = str(params.get("confirmed", "")).lower()
+            if confirmed not in ("yes", "true", "1", "confirm"):
+                verb = "restart" if is_restart else "shut down"
+                return (
+                    f"This will {verb} the computer immediately. "
+                    f"Confirm by calling again with confirmed='yes', "
+                    f"or pass delay_minutes to schedule it."
+                )
+
+        if is_restart:
+            restart_computer(delay_minutes * 60)
+        else:
+            shutdown_computer(delay_minutes * 60)
+
+        if delay_minutes > 0:
+            verb = "Restart" if is_restart else "Shutdown"
+            return (f"{verb} scheduled in {delay_minutes} minute(s). "
+                    f"Say 'cancel shutdown' to abort.")
+        return "Restart initiated." if is_restart else "Shutdown initiated."
+
+    if action in ("cancel_shutdown", "abort_shutdown", "cancel_restart",
+                  "abort_restart"):
+        cancel_shutdown()
+        return "Cancelled any pending shutdown or restart."
 
     if action in ("volume_set", "volume", "set_volume"):
         if value is None:
