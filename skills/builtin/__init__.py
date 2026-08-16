@@ -8,7 +8,7 @@ Each built-in skill is a thin, self-contained wrapper over an existing
 skill metadata — no action code runs until a tool is actually invoked.
 """
 
-from skills.builtin import browser, coding, files, youtube, telegram, system, research, finance, media
+from skills.builtin import browser, coding, files, youtube, telegram, system, research, finance, media, downloads
 
 BUILTIN_SKILLS = [
     browser.skill,
@@ -20,6 +20,7 @@ BUILTIN_SKILLS = [
     research.skill,
     finance.skill,
     media.skill,
+    downloads.skill,
 ]
 
 # 'custom' is not a built-in skill — it is the reserved on-disk namespace for

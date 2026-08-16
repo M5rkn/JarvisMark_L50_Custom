@@ -170,6 +170,16 @@ def _get_steam_games(steam_path: Path) -> list[dict]:
                 continue
     return games
 
+def _is_installed_state(state: int) -> bool:
+    """Steam StateFlags bit 4 (0x4) = StateFullyInstalled."""
+    return bool(state & 4)
+
+
+def _is_downloading_state(state: int) -> bool:
+    """Steam StateFlags bit 1024 (0x400) = StateUpdateRunning (downloading/updating)."""
+    return bool(state & 1024)
+
+
 def _is_steam_running() -> bool:
     try:
         if is_windows():
@@ -354,11 +364,13 @@ def _handle_install_dialog_pyautogui(game_name: str, best_drive: dict) -> str:
     drive_label = f"{best_drive['letter']}:"
     install_win = None
 
-    for _ in range(30):
+    for _ in range(40):
         time.sleep(0.5)
         for w in gw.getAllWindows():
-            if ("install" in w.title.lower() or "steam" in w.title.lower()) \
-                    and w.width > 300 and w.visible:
+            t = (w.title or "").lower()
+            if w.width > 300 and w.visible and (
+                "install" in t or "steam" in t or game_name.lower() in t
+            ):
                 install_win = w
                 break
         if install_win:
@@ -369,18 +381,103 @@ def _handle_install_dialog_pyautogui(game_name: str, best_drive: dict) -> str:
 
     try:
         install_win.activate()
-        time.sleep(0.4)
+        time.sleep(0.6)
     except Exception:
         pass
 
     wx, wy = install_win.left, install_win.top
     ww, wh = install_win.width, install_win.height
-    pyautogui.click(wx + int(ww * 0.35), wy + int(wh * 0.45))
+
+    # 1) Open the drive dropdown ("Choose location for install" row).
+    pyautogui.click(wx + int(ww * 0.5), wy + int(wh * 0.40))
+    time.sleep(0.5)
+    # 2) Select the drive by typing its letter, then Enter.
+    pyautogui.write(best_drive["letter"], interval=0.06)
+    time.sleep(0.25)
+    pyautogui.press("enter")
+    time.sleep(0.4)
+
+    # 3) Tick the "I agree" checkbox (lower-left area).
+    pyautogui.click(wx + int(ww * 0.10), wy + int(wh * 0.80))
     time.sleep(0.2)
-    pyautogui.typewrite(best_drive["letter"], interval=0.05)
-    time.sleep(0.2)
-    pyautogui.click(wx + int(ww * 0.72), wy + int(wh * 0.88))
-    return f"Attempted drive {drive_label} selection and Install click for '{game_name}'."
+
+    # 4) Click the "Install" button (bottom-right).
+    pyautogui.click(wx + int(ww * 0.92), wy + int(wh * 0.92))
+    return f"Attempted automatic drive {drive_label} selection and Install click for '{game_name}'."
+
+
+def _find_install_dialog():
+    """Return the Steam install dialog window (pywinauto), or None."""
+    try:
+        from pywinauto import Application, findwindows
+        for hwnd in findwindows.find_windows(
+            title_re=r"(?i)(install|yükle|steam)", visible_only=True
+        ):
+            try:
+                app  = Application(backend="uia").connect(handle=hwnd)
+                win  = app.window(handle=hwnd)
+                rect = win.rectangle()
+                if not win.is_visible() or rect.width() <= 300 or rect.height() <= 200:
+                    continue
+                all_text = " ".join(
+                    c.window_text() for c in win.descendants() if c.window_text()
+                ).upper()
+                if any(x in all_text for x in ("INSTALL", "YÜKLE", "C:", "D:", "E:")):
+                    return win
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _check_agreement(dialog) -> bool:
+    """Tick the 'I agree to the Steam Subscriber Agreement' checkbox if present."""
+    for ctrl in dialog.descendants(control_type="CheckBox"):
+        try:
+            txt = ctrl.window_text().lower()
+            if any(k in txt for k in ("agree", "subscriber", "terms", "katılıyorum", "abone")):
+                try:
+                    if ctrl.get_toggle_state() == 0:
+                        ctrl.click_input()
+                except Exception:
+                    ctrl.click_input()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _select_drive_by_click(dialog, drive_letter: str) -> bool:
+    """Fallback: open the drive dropdown by clicking the current drive row, then
+    click the target drive entry."""
+    target = drive_letter.upper()
+    try:
+        for ctrl in dialog.descendants():
+            try:
+                txt = ctrl.window_text().upper()
+                if not txt.strip() or len(txt) >= 80:
+                    continue
+                if target in txt:
+                    ctrl.click_input()
+                    return True
+                if ":" in txt or "GB" in txt or "FREE" in txt or "BOŞ" in txt:
+                    ctrl.click_input()   # open the dropdown
+                    time.sleep(0.3)
+                    for sub in dialog.descendants():
+                        try:
+                            st = sub.window_text().upper()
+                            if target in st and len(st) < 40:
+                                sub.click_input()
+                                return True
+                        except Exception:
+                            continue
+                    return False
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
 
 
 def _handle_install_dialog(game_name: str) -> str:
@@ -393,52 +490,54 @@ def _handle_install_dialog(game_name: str) -> str:
     print(f"[GameUpdater] 🏆 Hedef sürücü: {drive_label} ({best_drive['free_gb']:.1f} GB boş)")
 
     try:
-        from pywinauto import Application, findwindows
-        dialog = None
-
-        for _ in range(40):
-            time.sleep(0.5)
-            try:
-                for hwnd in findwindows.find_windows(
-                    title_re=r"(?i)(install|yükle|steam)", visible_only=True
-                ):
-                    try:
-                        app  = Application(backend="uia").connect(handle=hwnd)
-                        win  = app.window(handle=hwnd)
-                        rect = win.rectangle()
-                        if win.is_visible() and rect.width() > 300 and rect.height() > 200:
-                            all_text = " ".join(
-                                c.window_text() for c in win.descendants()
-                                if c.window_text()
-                            ).upper()
-                            if any(x in all_text for x in
-                                   ("C:", "D:", "E:", "F:", "INSTALL", "YÜKLE")):
-                                dialog = win
-                                break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            if dialog:
-                break
-
-        if not dialog:
-            raise RuntimeError("Dialog bulunamadı")
-
-        dialog.set_focus()
-        time.sleep(0.4)
-        drive_selected  = _select_drive_in_dialog(dialog, drive_letter)
-        install_clicked = _click_button(
-            dialog, ["install", "yükle", "next", "ileri", "ok", "tamam"]
-        )
-
-        if install_clicked:
-            suffix = f"Selected {drive_label} and" if drive_selected else "Default drive used, but"
-            return f"{suffix} clicked Install for '{game_name}'."
-        return f"Please click Install manually in Steam for '{game_name}'."
-
+        import pywinauto  # noqa: F401
     except ImportError:
         return _handle_install_dialog_pyautogui(game_name, best_drive)
+
+    # Wait for the first install dialog to appear.
+    dialog = None
+    for _ in range(40):
+        time.sleep(0.5)
+        dialog = _find_install_dialog()
+        if dialog:
+            break
+    if not dialog:
+        return _handle_install_dialog_pyautogui(game_name, best_drive)
+
+    try:
+        dialog.set_focus()
+        time.sleep(0.4)
+
+        drive_selected = _select_drive_in_dialog(dialog, drive_letter)
+        if not drive_selected:
+            drive_selected = _select_drive_by_click(dialog, drive_letter)
+
+        # Tick the agreement box, then advance (Next) or finish (Install).
+        _check_agreement(dialog)
+        install_clicked = _click_button(dialog, ["install", "yükle", "finish", "bitir"])
+        if not install_clicked:
+            install_clicked = _click_button(dialog, ["next", "ileri", "continue", "devam"])
+
+        # Steam renders its dialog in an embedded browser, so pywinauto often
+        # cannot see the buttons. Fall back to mouse automation if nothing was
+        # actually clicked.
+        if not install_clicked:
+            return _handle_install_dialog_pyautogui(game_name, best_drive)
+
+        # Steam may use a two-step wizard: after "Next" a second dialog shows the
+        # agreement + "Install". Keep finishing any remaining dialog.
+        for _ in range(8):
+            time.sleep(0.6)
+            d2 = _find_install_dialog()
+            if not d2:
+                break
+            _check_agreement(d2)
+            if _click_button(d2, ["install", "yükle", "finish", "bitir", "ok", "tamam"]):
+                break
+            _click_button(d2, ["next", "ileri", "continue", "devam"])
+
+        suffix = f"Selected {drive_label}." if drive_selected else "Using default drive."
+        return f"{suffix} Install flow automated for '{game_name}'."
     except Exception as e:
         print(f"[GameUpdater] ⚠️ pywinauto başarısız: {e}")
         return _handle_install_dialog_pyautogui(game_name, best_drive)
@@ -723,14 +822,14 @@ def _install_steam_game(steam_path: Path, game_name: str = None,
     if already:
         state = already["state"]
         name  = already["name"]
-        if state == 4:
-            return _launch_steam_game(steam_path, app_id=already["id"])
-        if state == 1026:
+        if _is_downloading_state(state):
             return f"'{name}' is currently downloading or updating."
-        if state in (6, 516):
+        if _is_installed_state(state):
+            return _launch_steam_game(steam_path, app_id=already["id"])
+        if state in (1, 6, 516):
             _launch_steam_url(exe, f"steam://update/{already['id']}")
             return f"'{name}' has a pending update. Update started."
-        return _launch_steam_game(steam_path, app_id=already["id"])
+        # state == 0 (leftover manifest, not actually installed) → install below.
 
     if not app_id and game_name:
         found_id, found_name = _search_steam_appid(game_name)
@@ -1192,31 +1291,9 @@ def game_updater(parameters: dict, player=None, speak=None) -> str:
                 results.append("Steam: Not installed.")
             else:
                 if game_name:
-                    installed  = _get_steam_games(steam_path)
-                    name_lower = game_name.lower()
-                    is_installed = any(
-                        name_lower in g["name"].lower() for g in installed
-                    )
-                    if action == "install" and is_installed:
-                        msg = _launch_steam_game(
-                            steam_path, game_name=game_name, app_id=app_id
-                        )
-                        if player:
-                            player.write_log(f"[GameUpdater] {msg[:100]}")
-                        if speak:
-                            speak(msg)
-                        return msg
-                    if not is_installed:
-                        if action == "install":
-                            launch_msg = _launch_steam_game(
-                                steam_path, game_name=game_name, app_id=app_id
-                            )
-                            if not launch_msg.startswith("Could not find"):
-                                if player:
-                                    player.write_log(f"[GameUpdater] {launch_msg[:100]}")
-                                if speak:
-                                    speak(launch_msg)
-                                return launch_msg
+                    if action == "install":
+                        # _install_steam_game decides: launch if already
+                        # installed, report if downloading, install otherwise.
                         msg = _install_steam_game(
                             steam_path, game_name=game_name, app_id=app_id
                         )
@@ -1227,13 +1304,14 @@ def game_updater(parameters: dict, player=None, speak=None) -> str:
                                 daemon=True
                             ).start()
                             msg += " Auto-shutdown enabled."
-                        if player: player.write_log(f"[GameUpdater] {msg[:100]}")
-                        if speak:  speak(msg)
+                        if player:
+                            player.write_log(f"[GameUpdater] {msg[:100]}")
+                        if speak:
+                            speak(msg)
                         return msg
-                    else:
-                        results.append(
-                            f"Steam: {_update_steam_games(steam_path, game_name=game_name)}"
-                        )
+                    results.append(
+                        f"Steam: {_update_steam_games(steam_path, game_name=game_name)}"
+                    )
                 else:
                     if action == "install":
                         results.append("Steam: Please specify a game name to install.")

@@ -131,6 +131,19 @@
         "media_control"
       ],
       "config": {}
+    },
+    "downloads": {
+      "builtin": true,
+      "tools": [
+        "download_file"
+      ],
+      "enabled": true,
+      "permissions_granted": [
+        "filesystem",
+        "network",
+        "execution"
+      ],
+      "config": {}
     }
   }
 }

@@ -206,7 +206,7 @@ def _nvml_gpu_windows() -> float:
                     continue
 
         if _nvml_lib is None:
-            import pynvml
+            import pynvml  # type: ignore
             pynvml.nvmlInit()
             h = pynvml.nvmlDeviceGetHandleByIndex(0)
             _nvml_ok = True
@@ -230,6 +230,13 @@ class _SysMetrics:
         self.net = 0.0
         self.gpu = -1.0
         self.tmp = -1.0
+        self.disk: list = []
+        self.procs: list = []
+        self._proc_primed = False
+        self._gpu_cache = -1.0
+        self._tmp_cache = -1.0
+        self._disk_cache: list = []
+        self._procs_cache: list = []
         self._lock = threading.Lock()
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
@@ -238,14 +245,16 @@ class _SysMetrics:
         t.start()
 
     def _loop(self):
+        tick = 0
         while self._running:
             try:
-                self._update()
+                tick += 1
+                self._update(tick)
             except Exception:
                 pass
             time.sleep(1.5)
 
-    def _update(self):
+    def _update(self, tick=0):
         cpu = psutil.cpu_percent(interval=None)
         mem = psutil.virtual_memory().percent
 
@@ -261,8 +270,25 @@ class _SysMetrics:
         self._last_net   = nc
         self._last_net_t = now
 
-        gpu = self._get_gpu()
-        tmp = self._get_temp()
+        # Slow metrics are polled every ~6s (not every 1.5s) so the app stays
+        # light. WMI temperature + process enumeration + GPU are the costly ones.
+        gpu   = self._gpu_cache
+        tmp   = self._tmp_cache
+        disk  = self._disk_cache
+        procs = self._procs_cache
+        if tick % 4 == 1:
+            tmp  = self._get_temp()
+            disk = self._get_disk()
+        if tick % 4 == 2:
+            procs = self._get_procs()
+        if tick % 4 == 3:
+            gpu = self._get_gpu()
+
+        # Persist back to the caches so values survive between slow polls.
+        self._gpu_cache   = gpu
+        self._tmp_cache   = tmp
+        self._disk_cache  = disk
+        self._procs_cache = procs
 
         with self._lock:
             self.cpu = cpu
@@ -270,10 +296,45 @@ class _SysMetrics:
             self.net = net
             self.gpu = gpu
             self.tmp = tmp
+            self.disk = disk
+            self.procs = procs
+
+    def _get_disk(self) -> list:
+        try:
+            mounts = [p.mountpoint for p in psutil.disk_partitions()
+                      if p.fstype and p.mountpoint]
+            out = []
+            for mp in mounts[:2]:
+                u = psutil.disk_usage(mp)
+                out.append((mp, u.percent))
+            return out
+        except Exception:
+            return []
+
+    def _get_procs(self) -> list:
+        try:
+            if not self._proc_primed:
+                psutil.cpu_percent(interval=None)
+                self._proc_primed = True
+            # Normalise to the whole machine (100% = all cores) so values never
+            # exceed 100 and match Task Manager's convention.
+            cores = psutil.cpu_count(logical=True) or 1
+            procs = []
+            for p in psutil.process_iter(['name', 'cpu_percent', 'memory_percent']):
+                try:
+                    procs.append((p.info['name'] or '?',
+                                  (p.info['cpu_percent'] or 0.0) / cores,
+                                  p.info['memory_percent'] or 0.0))
+                except Exception:
+                    continue
+            procs.sort(key=lambda r: r[2], reverse=True)
+            return procs[:5]
+        except Exception:
+            return []
 
     def _get_gpu(self) -> float:
         try:
-            import pynvml
+            import pynvml  # type: ignore
             pynvml.nvmlInit()
             h = pynvml.nvmlDeviceGetHandleByIndex(0)
             return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
@@ -313,7 +374,7 @@ class _SysMetrics:
             pass
         if _OS == "Windows":
             try:
-                import wmi
+                import wmi  # type: ignore
                 w = wmi.WMI(namespace="root/wmi")
                 tz = w.MSAcpi_ThermalZoneTemperature()
                 if tz:
@@ -330,6 +391,8 @@ class _SysMetrics:
                 "net": self.net,
                 "gpu": self.gpu,
                 "tmp": self.tmp,
+                "disk": list(self.disk),
+                "procs": list(self.procs),
             }
 
 
@@ -514,11 +577,11 @@ class JarvisCore(QWidget):
         self._pulse      = 0.0
         self._burst      = 0.0
         self._prev_speak = False
-        self._wave       = [0.0] * 96
+        self._wave       = [0.0] * 64
         self._particles: list[list[float]] = []
-        self._nodes      = [random.uniform(0, 2 * math.pi) for _ in range(7)]
-        self._node_speed = [random.uniform(0.05, 0.14) for _ in range(7)]
-        self._node_r     = [random.uniform(0.80, 1.10) for _ in range(7)]
+        self._nodes      = [random.uniform(0, 2 * math.pi) for _ in range(5)]
+        self._node_speed = [random.uniform(0.05, 0.14) for _ in range(5)]
+        self._node_r     = [random.uniform(0.80, 1.10) for _ in range(5)]
         self._face_px: QPixmap | None = None
 
         if face_path:
@@ -526,7 +589,7 @@ class JarvisCore(QWidget):
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
+        self._tmr.start(80)
 
     def _load_face(self, path: str):
         try:
@@ -590,11 +653,6 @@ class JarvisCore(QWidget):
         self._t      += dt
         act = self._activity()
 
-        if self.speaking and not self._prev_speak:
-            self._burst = 1.0
-        self._prev_speak = self.speaking
-        self._burst = max(0.0, self._burst - dt * 2.2)
-
         self._breathe += dt
 
         # glow target by state
@@ -610,127 +668,45 @@ class JarvisCore(QWidget):
             tgt = 26.0 + 5.0 * math.sin(self._t * 1.4)
         self._glow += (tgt - self._glow) * (1.0 - math.exp(-dt * 5.0))
 
-        self._pulse += dt * (0.30 if self.speaking else 0.08)
-        if self._pulse > 1.0:
-            self._pulse = 0.0
-
-        # waveform
-        if self.speaking:
-            amp = 0.9 + 0.5 * self._burst
-        elif self.state == "LISTENING":
-            amp = 0.35
-        elif self.state in ("THINKING", "PROCESSING"):
-            amp = 0.22
-        else:
-            amp = 0.06
-        if self.muted:
-            amp = 0.0
-        for i in range(len(self._wave)):
-            ph = self._t * (3.4 + 2.6 * act) + i * 0.34
-            self._wave[i] = (math.sin(ph) * 0.55 + math.sin(ph * 2.31 + i) * 0.30
-                             + math.sin(ph * 4.7) * 0.15) * amp
-
-        # nodes drift
-        for i in range(len(self._nodes)):
-            self._nodes[i] += dt * self._node_speed[i] * (0.5 + act)
-
-        # particles
-        cx, cy = self.width() / 2, self.height() / 2
-        fw = min(self.width(), self.height())
-        if random.random() < (0.02 + 0.09 * act):
-            ang = random.uniform(0, 2 * math.pi)
-            r   = fw * random.uniform(0.15, 0.55)
-            self._particles.append([
-                cx + math.cos(ang) * r,
-                cy + math.sin(ang) * r,
-                random.uniform(-0.5, 0.5),
-                random.uniform(-1.4, -0.4),
-                random.uniform(0.4, 1.0),
-                random.uniform(0.8, 2.0),
-            ])
-        kept: list[list[float]] = []
-        for pt in self._particles:
-            x, y, vx, vy, life, sz = pt
-            x += vx * dt * 18.0
-            y += vy * dt * 18.0
-            life -= dt * 0.30
-            if life > 0:
-                kept.append([x, y, vx, vy, life, sz])
-        self._particles = kept
+        # Adaptive frame rate: ~30 fps while active, a relaxed ~10 fps when idle.
+        target = 33 if (act > 0.20 or self.speaking) else 100
+        if self._tmr.interval() != target:
+            self._tmr.setInterval(target)
 
         self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         W, H = self.width(), self.height()
         cx, cy = W / 2, H / 2
         fw = min(W, H)
-        act   = self._activity()
-        glow  = self._glow
-        acc   = self._accent()
+        act  = self._activity()
+        glow = self._glow
+        acc  = self._accent()
 
-        # 1) background — graphite with a faint cyan core glow
+        # background
         bg = QLinearGradient(0, 0, 0, H)
         bg.setColorAt(0.0, QColor("#0c1014"))
         bg.setColorAt(1.0, QColor("#07090b"))
         p.fillRect(self.rect(), QBrush(bg))
 
+        # halo
         halo = QRadialGradient(cx, cy, fw * 0.62)
         halo.setColorAt(0.0, qcol(acc, int(18 + 26 * act)))
         halo.setColorAt(1.0, qcol(acc, 0))
         p.fillRect(self.rect(), QBrush(halo))
 
-        # 2) face — faint, behind the core (the startup photo is shown as a
-        # separate splash before this window appears)
-        if self._face_px:
-            fsz = int(fw * 0.30)
-            scaled = self._face_px.scaled(
-                fsz, fsz,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            p.setOpacity(0.10)
-            p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), scaled)
-            p.setOpacity(1.0)
+        core_r = fw * (0.16 + 0.012 * math.sin(self._breathe * 1.4))
 
-        core_r = fw * (0.15 + 0.012 * math.sin(self._breathe * 1.4))
+        # soft outer glow disc
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(qcol(acc, int(glow * 0.55))))
+        p.drawEllipse(QRectF(cx - core_r * 2.3, cy - core_r * 2.3,
+                             core_r * 4.6, core_r * 4.6))
 
-        # 3) neural constellation — faint lines + drifting nodes
-        node_pts = []
-        for i, a0 in enumerate(self._nodes):
-            a = a0
-            r = core_r * self._node_r[i] * 2.6
-            nx = cx + math.cos(a) * r
-            ny = cy + math.sin(a) * r * 0.72
-            node_pts.append((nx, ny))
-
-        p.setPen(QPen(qcol(acc, int(16 + 30 * act)), 1))
-        for i, (nx, ny) in enumerate(node_pts):
-            # center link
-            p.drawLine(QPointF(cx, cy), QPointF(nx, ny))
-            # neighbor link
-            nx2, ny2 = node_pts[(i + 1) % len(node_pts)]
-            p.drawLine(QPointF(nx, ny), QPointF(nx2, ny2))
-
-        for i, (nx, ny) in enumerate(node_pts):
-            pulse = 0.5 + 0.5 * math.sin(self._t * 2.0 + i * 1.1)
-            sz = 1.6 + 1.6 * pulse * act
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(qcol(acc, int(120 + 100 * pulse * act))))
-            p.drawEllipse(QPointF(nx, ny), sz, sz)
-
-        # 4) core sphere — layered, with an off-centre light source (3D depth)
-        for i in range(6):
-            frc = 1.0 - i / 6
-            r = core_r * (2.6 - i * 0.26)
-            a = int(glow * 0.85 * frc)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(qcol(acc, max(0, min(255, a)))))
-            p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
-
+        # core sphere
         sphere = QRadialGradient(cx - core_r * 0.35, cy - core_r * 0.42, core_r * 1.7)
         sphere.setColorAt(0.0, qcol(C.WHITE, 235))
         sphere.setColorAt(0.25, qcol(acc, 210))
@@ -740,47 +716,27 @@ class JarvisCore(QWidget):
         p.setBrush(QBrush(sphere))
         p.drawEllipse(QRectF(cx - core_r, cy - core_r, core_r * 2, core_r * 2))
 
-        # 5) waveform ribbon — horizontal energy line across the core
-        if amp := max(abs(x) for x in self._wave):
-            n = len(self._wave)
-            span = core_r * 2.9
-            mid_y = cy + core_r * 0.05
-            path = QPainterPath()
-            for i in range(n + 1):
-                idx = i % n
-                x = cx - span + (i / n) * 2 * span
-                y = mid_y + self._wave[idx] * core_r * 0.55
-                if i == 0:
-                    path.moveTo(x, y)
-                else:
-                    path.lineTo(x, y)
-            p.setPen(QPen(qcol(acc, min(255, int(90 + glow))), 1.4))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(path)
+        # faint static orbit ring
+        p.setPen(QPen(qcol(acc, 40), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), core_r * 2.2, core_r * 2.2)
 
-        # 6) breathing pulse ring (subtle, single)
-        if act > 0.05 and not self.muted:
-            pr = core_r * (1.3 + self._pulse * 1.1)
-            al = int(70 * (1.0 - self._pulse))
-            p.setPen(QPen(qcol(acc, al), 1.2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
+        # assistant name
+        name_fs = max(13, int(fw * 0.060))
+        p.setFont(QFont(_UI_FONT, name_fs, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.WHITE, 235), 1))
+        p.drawText(QRectF(cx - core_r * 1.7, cy - core_r * 0.60,
+                          core_r * 3.4, core_r * 1.2),
+                   Qt.AlignmentFlag.AlignCenter, self._assistant_name)
 
-        # 7) particles
-        for pt in self._particles:
-            x, y, _vx, _vy, life, sz = pt
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(qcol(acc, int(160 * life))))
-            p.drawEllipse(QPointF(x, y), sz, sz)
-
-        # 8) status label
+        # status label
         txt, col = self._status_label()
-        sy = cy + fw * 0.46
+        sy = cy + fw * 0.44
         p.setFont(QFont(_UI_FONT, 10, QFont.Weight.Light))
         p.setPen(QPen(qcol(col, 210), 1))
         p.drawText(QRectF(0, sy, W, 22), Qt.AlignmentFlag.AlignCenter, txt)
 
-        # 9) corner brackets — minimal
+        # corner brackets
         bl, m = 14, 10
         p.setPen(QPen(qcol(C.BORDER_B, 90), 1))
         for bx, by, dx, dy in ((m, m, 1, 1), (W - m, m, -1, 1),
@@ -914,14 +870,18 @@ class MicrophoneButton(QPushButton):
         self.setToolTip("Toggle microphone")
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._tick)
-        self._tmr.start(40)
+        self._tmr.start(80)
 
     def set_muted(self, muted: bool):
         self._muted = muted
+        if muted:
+            self._tmr.stop()
+        elif not self._tmr.isActive():
+            self._tmr.start()
         self.update()
 
     def _tick(self):
-        self._pulse = (self._pulse + 0.05) % (2 * math.pi)
+        self._pulse = (self._pulse + 0.08) % (2 * math.pi)
         if not self._muted:
             self.update()
 
@@ -1099,7 +1059,6 @@ class FileDropZone(QWidget):
         self._dash_offset = 0.0
         self._anim_tmr = QTimer(self)
         self._anim_tmr.timeout.connect(self._animate)
-        self._anim_tmr.start(40)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -1135,10 +1094,12 @@ class FileDropZone(QWidget):
 
     def enterEvent(self, e):
         self._hovering = True
+        self._anim_tmr.start(40)
         self._canvas.update()
 
     def leaveEvent(self, e):
         self._hovering = False
+        self._anim_tmr.stop()
         self._canvas.update()
 
     def current_file(self) -> str | None:
@@ -1966,6 +1927,122 @@ class RemoteKeyOverlay(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  HUD widgets — panels + waveform
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _BarGauge(QWidget):
+    """Single horizontal usage bar with a right-aligned value."""
+
+    def __init__(self, label: str, color: str = C.PRI, parent=None):
+        super().__init__(parent)
+        self._label = label
+        self._color = color
+        self._value = 0.0
+        self._text = "--"
+        self.setFixedHeight(24)
+
+    def set_value(self, pct: float, text: str):
+        self._value = max(0.0, min(100.0, pct))
+        self._text = text
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.setFont(QFont(_MONO_FONT, 7, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.TEXT_DIM, 220), 1))
+        p.drawText(QRectF(0, 0, 34, H),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   self._label)
+        p.setPen(QPen(qcol(C.TEXT_MED, 230), 1))
+        p.drawText(QRectF(W - 52, 0, 52, H),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   self._text)
+        track = QRectF(36, H * 0.5 - 3, W - 92, 6)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(C.BAR_BG)))
+        p.drawRoundedRect(track, 3, 3)
+        w = max(0.0, track.width() * (self._value / 100.0))
+        if w > 0:
+            p.setBrush(QBrush(qcol(self._color, 230)))
+            p.drawRoundedRect(QRectF(track.left(), track.top(), w, track.height()), 3, 3)
+
+
+class _LineGraph(QWidget):
+    """A live line graph (network throughput, etc)."""
+
+    def __init__(self, color: str = C.PRI, parent=None):
+        super().__init__(parent)
+        self._color = color
+        self._hist: list[float] = [0.0] * 48
+        self.setFixedHeight(42)
+
+    def push(self, v: float):
+        self._hist.append(v)
+        self._hist = self._hist[-48:]
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        n = len(self._hist)
+        if n < 2:
+            return
+        peak = max(1.0, max(self._hist))
+        path = QPainterPath()
+        for i, v in enumerate(self._hist):
+            x = (i / (n - 1)) * W
+            y = H - (v / peak) * (H - 4) - 2
+            if i == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        p.setPen(QPen(qcol(self._color, 180), 1.2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+        area = QPainterPath(path)
+        area.lineTo(W, H)
+        area.lineTo(0, H)
+        area.closeSubpath()
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0, qcol(self._color, 55))
+        grad.setColorAt(1.0, qcol(self._color, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawPath(area)
+
+
+def _info_row(label: str, value: str) -> QWidget:
+    w = QWidget()
+    w.setStyleSheet("background: transparent;")
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(8)
+    l = QLabel(label)
+    l.setFont(QFont(_MONO_FONT, 7, QFont.Weight.Bold))
+    l.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+    v = QLabel(value)
+    v.setFont(QFont(_MONO_FONT, 7))
+    v.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+    v.setAlignment(Qt.AlignmentFlag.AlignRight)
+    v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    lay.addWidget(l, stretch=0)
+    lay.addWidget(v, stretch=1)
+    return w
+
+
+def _panel_title(text: str) -> QLabel:
+    l = QLabel(text.upper())
+    l.setFont(QFont(_UI_FONT, 8, QFont.Weight.Bold))
+    l.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; "
+                    f"letter-spacing: 1px;")
+    return l
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Main window
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2072,7 +2149,15 @@ class MainWindow(QMainWindow):
         self._center_split.setStretchFactor(0, 3)
         self._center_split.setStretchFactor(1, 1)
         self._center_split.setCollapsible(0, False)
-        body.addWidget(self._center_split, stretch=5)
+
+        center_col = QWidget()
+        center_col.setStyleSheet("background: transparent;")
+        cv = QVBoxLayout(center_col)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(6)
+        cv.addWidget(self._center_split, stretch=1)
+        cv.addWidget(self._build_voice_zone())
+        body.addWidget(center_col, stretch=5)
 
         body.addWidget(self._build_right_panel(), stretch=0)
 
@@ -2093,8 +2178,11 @@ class MainWindow(QMainWindow):
         self._metric_tmr.timeout.connect(self._update_metrics)
         self._metric_tmr.start(2000)
         self._update_metrics()
+        self._fill_sysinfo()
+        self._update_processes()
 
         self._log_sig.connect(self._activity.append_log)
+        self._log_sig.connect(self._update_voice_msg)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -2205,11 +2293,85 @@ class MainWindow(QMainWindow):
         self._clock_lbl.setText(time.strftime("%H:%M:%S"))
         self._date_lbl.setText(time.strftime("%a %d %b %Y"))
 
-    # ── left panel — system metrics ─────────────────────────────────────────
-    def _build_left_panel(self) -> QWidget:
-        panel = ModernPanel("System", radius=12)
-        panel.setFixedWidth(_LEFT_W)
+    # ── voice zone (waveform + current message under the core) ──────────────
+    def _build_voice_zone(self) -> QWidget:
+        zone = QWidget()
+        zone.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(zone)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(3)
 
+        self._current_msg_lbl = QLabel("How can I help you, sir?")
+        self._current_msg_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._current_msg_lbl.setFont(QFont(_UI_FONT, 9))
+        self._current_msg_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        lay.addWidget(self._current_msg_lbl)
+        return zone
+
+    def _update_voice_msg(self, text: str):
+        try:
+            tl = text.lower()
+            if tl.startswith("jarvis:") or tl.startswith(f"{self._assistant_name.lower()}:"):
+                self._current_msg_lbl.setText(text.split(":", 1)[1].strip()[:160])
+        except Exception:
+            pass
+
+    def _send_command(self, cmd: str):
+        self._activity.append_log(f"You: {cmd}")
+        if self.on_text_command:
+            threading.Thread(target=self.on_text_command, args=(cmd,), daemon=True).start()
+
+    def _fill_sysinfo(self):
+        try:
+            os_name = f"{platform.system()} {platform.release()}"
+        except Exception:
+            os_name = platform.system()
+        try:
+            cpu = platform.processor() or "Unknown"
+            cpu = cpu if len(cpu) <= 24 else cpu[:24] + "…"
+        except Exception:
+            cpu = "Unknown"
+        try:
+            ram_total = psutil.virtual_memory().total / (1024 ** 3)
+            ram_str = f"{ram_total:.0f} GB"
+        except Exception:
+            ram_str = "--"
+        try:
+            gpu = "NVIDIA" if _metrics.snapshot()["gpu"] >= 0 else "Integrated"
+        except Exception:
+            gpu = "Integrated"
+        try:
+            disk_total = sum(
+                psutil.disk_usage(p.mountpoint).total
+                for p in psutil.disk_partitions() if p.fstype and p.mountpoint
+            ) / (1024 ** 3)
+            disk_str = f"{disk_total:.0f} GB"
+        except Exception:
+            disk_str = "--"
+        vals = {"os": os_name, "cpu": cpu, "gpu": gpu, "ram": ram_str, "disk": disk_str}
+        for k, v in vals.items():
+            if k in self._info_vals:
+                self._info_vals[k].setText(v)
+
+    def _update_processes(self):
+        try:
+            top = _metrics.snapshot()["procs"]
+            lines = [f"{nm[:14]:<14} {min(100, cpu):>4.0f}% {mem:>5.1f}%"
+                     for nm, cpu, mem in top]
+            self._proc_list_lbl.setText("\n".join(lines) if lines else "—")
+        except Exception:
+            self._proc_list_lbl.setText("—")
+
+    # ── left panel — system / storage / network ─────────────────────────────
+    def _build_left_panel(self) -> QWidget:
+        wrap = QWidget()
+        wrap.setFixedWidth(_LEFT_W)
+        wrap.setStyleSheet("background: transparent;")
+        outer = QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+
+        sys_panel = ModernPanel("System", radius=12)
         self._metric_cpu = SystemMetric("CPU", C.PRI)
         self._metric_mem = SystemMetric("MEM", C.PRI_DIM)
         self._metric_net = SystemMetric("NET", C.TEXT_MED)
@@ -2217,20 +2379,35 @@ class MainWindow(QMainWindow):
         self._metric_tmp = SystemMetric("TMP", C.TEXT_MED, unit="°C")
         for m in [self._metric_cpu, self._metric_mem, self._metric_net,
                   self._metric_gpu, self._metric_tmp]:
-            panel.addWidget(m)
-
-        panel.addStretch(1)
+            sys_panel.addWidget(m)
 
         info = QLabel("UPTIME  --:--\nPROCESS  --")
         info.setObjectName("info")
         info.setFont(QFont(_MONO_FONT, 7))
         info.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         self._uptime_lbl = info
-        panel.addWidget(info)
+        sys_panel.addWidget(info)
+        self._proc_lbl = info  # compatibility alias
+        outer.addWidget(sys_panel)
 
-        self._proc_lbl = info  # compatibility alias (updated via _update_metrics)
+        disk_panel = ModernPanel("Storage", radius=12)
+        self._disk_g1 = _BarGauge("C:", C.PRI)
+        self._disk_g2 = _BarGauge("D:", C.GREEN)
+        disk_panel.addWidget(self._disk_g1)
+        disk_panel.addWidget(self._disk_g2)
+        outer.addWidget(disk_panel)
 
-        return panel
+        net_panel = ModernPanel("Network", radius=12)
+        self._net_graph = _LineGraph(C.PRI)
+        net_panel.addWidget(self._net_graph)
+        self._net_rate_lbl = QLabel("--")
+        self._net_rate_lbl.setFont(QFont(_MONO_FONT, 7, QFont.Weight.Bold))
+        self._net_rate_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        net_panel.addWidget(self._net_rate_lbl)
+        outer.addWidget(net_panel)
+
+        outer.addStretch(1)
+        return wrap
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
@@ -2277,45 +2454,90 @@ class MainWindow(QMainWindow):
 
         self._uptime_lbl.setText(f"{uptime}\n{proc}")
 
-    # ── right panel — activity + file upload ────────────────────────────────
+        # disk usage — cached from the background telemetry thread
+        try:
+            for idx, gauge in ((0, self._disk_g1), (1, self._disk_g2)):
+                if idx < len(snap["disk"]):
+                    _mp, pct = snap["disk"][idx]
+                    gauge.set_value(pct, f"{pct:.0f}%")
+                else:
+                    gauge.set_value(0, "--")
+        except Exception:
+            pass
+
+        # network graph + throughput
+        net = snap["net"]
+        self._net_graph.push(net)
+        if net < 1.0:
+            self._net_rate_lbl.setText(f"THROUGHPUT  {net*1024:.0f} KB/s")
+        else:
+            self._net_rate_lbl.setText(f"THROUGHPUT  {net:.1f} MB/s")
+
+        self._update_processes()
+
+    # ── right panel — info / processes / recommendations / activity ─────────
     def _build_right_panel(self) -> QWidget:
-        panel = ModernPanel("", radius=12)
-        panel.setFixedWidth(_RIGHT_W)
-        lay = panel.layout()
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(10)
+        wrap = QWidget()
+        wrap.setFixedWidth(_RIGHT_W)
+        wrap.setStyleSheet("background: transparent;")
+        outer = QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
 
-        title = QLabel("CONVERSATION")
-        title.setFont(QFont(_UI_FONT, 8, QFont.Weight.Bold))
-        title.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; "
-                            f"letter-spacing: 1px;")
-        lay.addWidget(title)
+        info_panel = ModernPanel("System Info", radius=12)
+        self._info_vals: dict[str, QLabel] = {}
+        for key, label in (("os", "OS"), ("cpu", "CPU"), ("gpu", "GPU"),
+                           ("ram", "RAM"), ("disk", "DISK")):
+            row_w = _info_row(label, "--")
+            info_panel.addWidget(row_w)
+            self._info_vals[key] = row_w.findChildren(QLabel)[-1]
+        outer.addWidget(info_panel)
 
+        proc_panel = ModernPanel("Processes", radius=12)
+        self._proc_list_lbl = QLabel("—")
+        self._proc_list_lbl.setFont(QFont(_MONO_FONT, 7))
+        self._proc_list_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        proc_panel.addWidget(self._proc_list_lbl)
+        outer.addWidget(proc_panel)
+
+        rec_panel = ModernPanel("Recommendations", radius=12)
+        for label, cmd in (
+            ("Run diagnostics", "Run a full system diagnostic and report the results."),
+            ("Optimize memory", "Check memory usage and suggest optimizations."),
+            ("System health", "Give me a quick system health overview."),
+            ("News briefing", "Give me today's top headlines."),
+        ):
+            b = QPushButton("▸  " + label)
+            b.setFixedHeight(24)
+            b.setFont(QFont(_UI_FONT, 8, QFont.Weight.Bold))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                    border: 1px solid {C.BORDER}; border-radius: 5px;
+                    text-align: left; padding: 0 8px; }}
+                QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+            """)
+            b.clicked.connect(lambda _, c=cmd: self._send_command(c))
+            rec_panel.addWidget(b)
+        outer.addWidget(rec_panel)
+
+        conv_panel = ModernPanel("Conversation", radius=12)
         self._activity = ActivityPanel()
-        lay.addWidget(self._activity, stretch=1)
+        conv_panel.addWidget(self._activity, stretch=1)
+        outer.addWidget(conv_panel, stretch=1)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER};")
-        lay.addWidget(sep)
-
-        ft = QLabel("FILE INPUT")
-        ft.setFont(QFont(_UI_FONT, 8, QFont.Weight.Bold))
-        ft.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; "
-                         f"letter-spacing: 1px;")
-        lay.addWidget(ft)
-
+        file_panel = ModernPanel("File Input", radius=12)
         self._drop_zone = FileDropZone()
         self._drop_zone.file_selected.connect(self._on_file_selected)
-        lay.addWidget(self._drop_zone)
-
+        file_panel.addWidget(self._drop_zone)
         self._file_hint = QLabel("No file loaded")
         self._file_hint.setFont(QFont(_UI_FONT, 7))
         self._file_hint.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
         self._file_hint.setWordWrap(True)
-        lay.addWidget(self._file_hint)
+        file_panel.addWidget(self._file_hint)
+        outer.addWidget(file_panel)
 
-        return panel
+        return wrap
 
     # ── command bar ─────────────────────────────────────────────────────────
     def _build_command_bar(self) -> QWidget:

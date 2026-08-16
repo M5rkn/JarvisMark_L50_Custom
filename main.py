@@ -92,6 +92,12 @@ SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
+# Voice-pipeline tuning.
+POST_SPEECH_GRACE     = 0.5   # seconds the mic stays suppressed after TTS ends (echo tail)
+END_OF_SPEECH_SILENCE = 1.2   # seconds of silence that mark the end of a user utterance
+MIN_SPEECH_SECONDS    = 0.3   # ignore end-of-speech unless at least this much speech was detected
+TOOL_DEDUP_WINDOW     = 2.5   # seconds within which an identical tool call is treated as a duplicate
+
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
@@ -775,6 +781,15 @@ class JarvisLive:
         self._model_activity   = 0.0               # monotonic time of last server message
         self._tool_busy        = False             # True while a tool call is executing
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._post_speech_until = 0.0              # monotonic time until mic re-enables after TTS (echo tail)
+        self._vad_speech_active = False            # local VAD: True during a detected speech burst
+        self._vad_last_speech   = 0.0              # monotonic time of last detected speech
+        self._vad_speech_start  = 0.0              # monotonic time the current speech burst started
+        self._vad_eos_sent      = False            # end-of-speech already signaled for current burst
+        self._last_tool_sig     = None             # (name, args_json) of last executed tool call
+        self._last_tool_time    = 0.0              # monotonic time of last tool execution
+        self._last_tool_speech  = 0.0              # _last_user_speech value at last tool execution
+        self._qfull_log_at      = 0.0              # last time we logged a full audio queue
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -803,6 +818,11 @@ class JarvisLive:
     def set_speaking(self, value: bool):
         with self._speaking_lock:
             self._is_speaking = value
+            if not value:
+                # Keep the mic suppressed for a short echo tail after JARVIS
+                # finishes speaking, so its own TTS (and the room's reverberation)
+                # is never captured and re-interpreted as a new command.
+                self._post_speech_until = time.monotonic() + POST_SPEECH_GRACE
         if value:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
@@ -839,16 +859,18 @@ class JarvisLive:
         )
 
     def speak_error(self, tool_name: str, error: str):
+        # Log only. The error text is already returned in the FunctionResponse,
+        # which the model phrases and speaks naturally — speaking it here too
+        # caused every failure to be announced twice.
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
 
         # Load customization from config
         try:
-            _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
+            _cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
             self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
             _user_name = (_cfg.get("user_name") or "").strip()
         except Exception:
@@ -928,8 +950,33 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
+        # ── Duplicate-command guard ─────────────────────────────────────────
+        # If the exact same tool call arrives again within a short window and no
+        # new user speech happened in between, it is an echo/duplicate (e.g.
+        # JARVIS hearing its own TTS) — suppress it instead of executing twice.
+        try:
+            sig = (name, json.dumps(args, sort_keys=True, default=str))
+        except Exception:
+            sig = (name, repr(args))
+        _now = time.monotonic()
+        if (
+            self._last_tool_sig == sig
+            and (_now - self._last_tool_time) < TOOL_DEDUP_WINDOW
+            and self._last_user_speech <= self._last_tool_speech
+        ):
+            print(f"[JARVIS] ⏭️ Duplicate suppressed: {name} {args}")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "duplicate_suppressed"},
+            )
+        self._last_tool_sig    = sig
+        self._last_tool_time   = _now
+        self._last_tool_speech = self._last_user_speech
+
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
+        if name not in ("save_memory", "add_memory", "recall_memory"):
+            self.ui.write_log(f"SYS: Executing {name}")
 
         if name == "save_memory":
             category = args.get("category", "notes")
@@ -1160,7 +1207,7 @@ class JarvisLive:
                 self.ui.write_log("SYS: Shutdown requested.")
                 async def _do_shutdown():
                     try:
-                        await self._save_session_summary()
+                        await asyncio.wait_for(self._save_session_summary(), timeout=5.0)
                     except Exception:
                         pass
                     if self.session:
@@ -1179,8 +1226,10 @@ class JarvisLive:
             elif name == "restart_jarvis":
                 self.ui.write_log("SYS: Restart requested.")
                 async def _do_restart():
+                    # Cap the summary save so a slow API never delays the
+                    # restart by tens of seconds.
                     try:
-                        await self._save_session_summary()
+                        await asyncio.wait_for(self._save_session_summary(), timeout=5.0)
                     except Exception:
                         pass
                     if self.session:
@@ -1193,11 +1242,12 @@ class JarvisLive:
                             )
                         except Exception:
                             pass
-                        # Let the restart phrase finish playing before restarting.
+                        # Let the restart phrase finish playing before restarting
+                        # (short timeouts so a stalled turn never blocks us).
                         try:
                             if self._turn_done_event:
-                                await asyncio.wait_for(self._turn_done_event.wait(), timeout=10.0)
-                            _deadline = time.monotonic() + 15.0
+                                await asyncio.wait_for(self._turn_done_event.wait(), timeout=5.0)
+                            _deadline = time.monotonic() + 5.0
                             while time.monotonic() < _deadline:
                                 with self._speaking_lock:
                                     speaking = self._is_speaking
@@ -1266,7 +1316,29 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
+            if isinstance(msg, dict) and msg.get("__eos__"):
+                # Local VAD detected the end of the user's utterance — tell the
+                # model so it finalises the turn immediately instead of waiting
+                # for its own (slower) activity detection.
+                await self.session.send_realtime_input(audio_stream_end=True)
+                continue
             await self.session.send_realtime_input(audio=msg)
+
+    def _push_audio(self, data: bytes):
+        """Queue a mic chunk for sending without ever crashing the callback."""
+        try:
+            self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm;rate=16000"})
+        except asyncio.QueueFull:
+            now = time.monotonic()
+            if now - self._qfull_log_at > 5.0:
+                self._qfull_log_at = now
+                print("[JARVIS] ⚠️ Audio send queue full — dropping a mic chunk")
+
+    def _signal_end_of_speech(self):
+        try:
+            self.out_queue.put_nowait({"__eos__": True})
+        except asyncio.QueueFull:
+            pass
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
@@ -1275,17 +1347,45 @@ class JarvisLive:
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted and not self._phone_active:
-                # Local voice-activity detection: marks real mic speech so the
-                # watchdog can tell "model is deaf" apart from "user is silent".
-                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
-                if rms > 500.0:
-                    self._mic_voice_time = time.monotonic()
-                data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm;rate=16000"}
-                )
+                post_speech_until = self._post_speech_until
+            now = time.monotonic()
+
+            # Suppress while JARVIS is speaking, during the post-speech echo
+            # tail, while muted, or while the phone mic is active. Reset the
+            # local VAD so a fresh utterance always starts from a clean state.
+            if jarvis_speaking or now < post_speech_until or self.ui.muted or self._phone_active:
+                self._vad_speech_active = False
+                self._vad_last_speech   = 0.0
+                self._vad_speech_start  = 0.0
+                self._vad_eos_sent      = False
+                return
+
+            # Local voice-activity detection: marks real mic speech so the
+            # watchdog can tell "model is deaf" apart from "user is silent",
+            # and lets us signal end-of-speech to the model promptly.
+            rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+            is_speech = rms > 500.0
+
+            if is_speech:
+                self._mic_voice_time = now
+                if not self._vad_speech_active:
+                    self._vad_speech_start = now
+                self._vad_last_speech   = now
+                self._vad_speech_active = True
+                self._vad_eos_sent      = False
+            elif (
+                self._vad_speech_active
+                and not self._vad_eos_sent
+                and (now - self._vad_last_speech) >= END_OF_SPEECH_SILENCE
+                and (now - self._vad_speech_start) >= MIN_SPEECH_SECONDS
+            ):
+                # The user finished speaking — prompt the model to respond now.
+                self._vad_eos_sent      = True
+                self._vad_speech_active = False
+                loop.call_soon_threadsafe(self._signal_end_of_speech)
+
+            data = indata.tobytes()
+            loop.call_soon_threadsafe(self._push_audio, data)
 
         try:
             with sd.InputStream(
@@ -1315,6 +1415,13 @@ class JarvisLive:
                         if self._interrupted:
                             pass  # discard: interrupted
                         else:
+                            # Mark speaking as soon as audio arrives (before it is
+                            # actually played) so the mic is suppressed for the full
+                            # playback window and JARVIS can't hear its own TTS.
+                            with self._speaking_lock:
+                                already_speaking = self._is_speaking
+                            if not already_speaking:
+                                self.set_speaking(True)
                             if self._turn_done_event and self._turn_done_event.is_set():
                                 self._turn_done_event.clear()
                             # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
@@ -1334,8 +1441,15 @@ class JarvisLive:
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
-                            if txt:
-                                in_buf.append(txt)
+                            if txt and txt != (in_buf[-1] if in_buf else ""):
+                                # Gemini streams cumulative full transcripts for the
+                                # current turn. Replace instead of stacking when the
+                                # new text extends the previous one, so the log and
+                                # session summary never show duplicated words.
+                                if in_buf and (in_buf[-1] in txt):
+                                    in_buf[-1] = txt
+                                else:
+                                    in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
@@ -1658,8 +1772,9 @@ class JarvisLive:
     # ── Stalled-session watchdog ──────────────────────────────────────────────
 
     async def _watchdog(self) -> None:
-        """Force a reconnect if the model goes silent while the user is speaking."""
-        STALL_SECONDS = 15.0
+        """Force a reconnect only when the model is truly unresponsive to a
+        finished utterance — never while the user is still speaking."""
+        STALL_SECONDS = 30.0
         while True:
             await asyncio.sleep(5.0)
             if not self.session:
@@ -1670,12 +1785,25 @@ class JarvisLive:
                 speaking = self._is_speaking
             if speaking or self.ui.muted:
                 continue
+
             now = time.monotonic()
+            # Never reconnect while the user is mid-utterance — the model is
+            # expected to stay silent until end-of-speech is detected. This was
+            # the cause of "JARVIS restarts while I speak".
+            if self._vad_speech_active:
+                continue
+            # Grace window after the user stopped talking, so a slow model
+            # response is never mistaken for a dead connection.
+            if now - self._vad_last_speech < 3.0:
+                continue
+            # User hasn't spoken recently — idle, nothing to recover from.
             if now - self._mic_voice_time >= 10.0:
-                continue   # user hasn't spoken recently — idle, not stalled
+                continue
+            # Model has been silent too long after a finished utterance.
             if now - self._model_activity < STALL_SECONDS:
                 continue
-            print("[Watchdog] ⚠️ Model silent while user speaking — forcing reconnect.")
+
+            print("[Watchdog] ⚠️ Model silent after user spoke — forcing reconnect.")
             self.ui.write_log("SYS: No response — reconnecting...")
             try:
                 await self.session.close()
@@ -1784,6 +1912,11 @@ class JarvisLive:
                     self._tool_busy            = False
                     self._mic_voice_time       = time.monotonic()
                     self._model_activity       = time.monotonic()
+                    self._post_speech_until    = 0.0
+                    self._vad_speech_active    = False
+                    self._vad_last_speech      = 0.0
+                    self._vad_speech_start     = 0.0
+                    self._vad_eos_sent         = False
 
                     print("[JARVIS] Connected.")
                     self.ui.set_state("LISTENING")
@@ -1827,6 +1960,24 @@ class JarvisLive:
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
 
+                # The asyncio default executor has been shut down (Python 3.12+
+                # asyncio.run() does this at loop teardown). This is unrecoverable
+                # in-place — every reconnect would fail with "cannot schedule new
+                # futures after shutdown" — so restart the whole process cleanly.
+                if "cannot schedule new futures" in err_str or "shutdown" in err_str.lower():
+                    print("[JARVIS] ⚠️ Executor shut down — restarting process…")
+                    self.ui.write_log("SYS: Restarting to recover connection…")
+                    import os as _os
+                    if getattr(sys, "frozen", False):
+                        _args = [sys.executable, *sys.argv[1:]]
+                    else:
+                        _args = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+                    try:
+                        _os.execv(sys.executable, _args)
+                    except Exception:
+                        _os._exit(1)
+                    return
+
                 # Invalid API key — stop hammering the API, prompt re-configuration
                 if "API key not valid" in err_str or "1007" in err_str:
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
@@ -1835,7 +1986,7 @@ class JarvisLive:
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
                     print("[JARVIS] New API key saved — reconnecting...")
-                    _conn_backoff = 3
+                    self._conn_backoff = 3
                     continue
 
                 # Network / timeout errors — log clearly and back off.
@@ -1849,7 +2000,7 @@ class JarvisLive:
                     "ConnectionRefusedError", "OSError", "Cannot connect",
                 ))
                 if is_net_err:
-                    _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
+                    _conn_backoff = min(getattr(self, "_conn_backoff", 2) * 2, 10)
                     self._conn_backoff = _conn_backoff
                     self.ui.write_log(
                         f"NET: Bağlantı kurulamadı — {_conn_backoff}s sonra tekrar deneniyor. "
@@ -1864,7 +2015,9 @@ class JarvisLive:
                     asyncio.create_task(self._save_session_summary())
 
             self.set_speaking(False)
-            self.ui.set_state("SLEEPING")
+            # Brief "reconnecting" state instead of "SLEEPING" so JARVIS never
+            # looks like it has gone to sleep during a quick reconnect.
+            self.ui.set_state("THINKING")
 
             if self._dashboard:
                 await self._dashboard.broadcast({"type": "status", "state": "sleeping"})
@@ -1874,6 +2027,20 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
+    # Unhandled-exception safety net: log to a file instead of losing the
+    # traceback, so a crash inside a Qt slot can be diagnosed after the fact.
+    import traceback as _traceback
+    def _excepthook(exc_type, exc, tb):
+        try:
+            _traceback.print_exception(exc_type, exc, tb)
+            with open(BASE_DIR / "jarvis_crash.log", "a", encoding="utf-8") as _f:
+                _f.write("=" * 60 + "\n")
+                _f.write(f"[{datetime.now().isoformat()}] Unhandled {exc_type.__name__}: {exc}\n")
+                _traceback.print_exception(exc_type, exc, tb, file=_f)
+        except Exception:
+            pass
+    sys.excepthook = _excepthook
+
     # Resolve the face image relative to the script, not the launch directory,
     # so the startup face appears no matter where JARVIS is started from.
     _face = BASE_DIR / "face.png"

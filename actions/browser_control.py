@@ -192,6 +192,104 @@ def switch_chrome_tab(keyword: str) -> bool:
     return False
 
 
+def _close_tab_by_cycling(keyword: str, exe_name: str) -> str | None:
+    """
+    Fallback for closing a Chromium tab when UI Automation only exposes the
+    active tab. Chrome builds its accessibility tree lazily, so background tabs
+    are often missing entirely — the only reliable way to reach them without a
+    CDP session is to cycle through them with Ctrl+Tab, reading the window title
+    (which always shows the active tab) after each step. Returns a "Closed the
+    …" string on success, or None if no usable window was found or no tab matched.
+    """
+    if _OS != "Windows":
+        return None
+    try:
+        from pywinauto import Application, findwindows
+        import psutil
+    except Exception:
+        return None
+
+    hwnds: list[int] = []
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if (proc.info["name"] or "").lower() == exe_name:
+                    hwnds.extend(findwindows.find_windows(
+                        process=proc.info["pid"], active_only=False))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if not hwnds:
+        return None
+
+    # Pick the largest visible top-level window — the main browser window.
+    app = Application(backend="uia")
+    best = None
+    best_area = 0
+    for hwnd in hwnds:
+        try:
+            w = app.connect(handle=hwnd).window(handle=hwnd)
+            r = w.rectangle()
+        except Exception:
+            continue
+        if r.width() < 300 or r.height() < 200:
+            continue
+        area = r.width() * r.height()
+        if area > best_area:
+            best, best_area = w, area
+    if best is None:
+        return None
+
+    try:
+        if best.is_minimized():
+            best.restore()
+        best.set_focus()
+    except Exception:
+        pass
+    time.sleep(0.4)
+
+    def _title() -> str:
+        try:
+            return (best.window_text() or "").strip()
+        except Exception:
+            return ""
+
+    start = _title()
+    if not start:
+        return None
+
+    kw = keyword.lower()
+    for _ in range(60):   # safety cap — Chrome windows rarely exceed this many tabs
+        cur = _title()
+        if kw in cur.lower():
+            try:
+                best.type_keys("^w", pause=0.05)
+            except Exception:
+                try:
+                    import pyautogui
+                    pyautogui.hotkey("ctrl", "w")
+                except Exception:
+                    pass
+            return f"Closed the '{cur}' tab."
+
+        # Advance to the next tab, then wait for the title to update.
+        try:
+            best.type_keys("^{TAB}", pause=0.05)
+        except Exception:
+            try:
+                import pyautogui
+                pyautogui.hotkey("ctrl", "tab")
+            except Exception:
+                pass
+        time.sleep(0.25)
+        if _title() == start:
+            # Cycled all the way around without a match.
+            break
+
+    return None
+
+
 def close_chrome_tab_by_name(keyword: str, browser: str = "chrome") -> str:
     """
     Close an existing Chromium-browser tab (including background tabs) whose
@@ -318,6 +416,13 @@ def close_chrome_tab_by_name(keyword: str, browser: str = "chrome") -> str:
                 return f"Closed the '{title}' tab."
         except Exception as e:
             print(f"[Browser] chrome tab close failed: {e}")
+
+    # Direct enumeration often exposes only the active tab (background tabs are
+    # missing from Chrome's accessibility tree). Fall back to cycling through
+    # tabs with Ctrl+Tab and matching the window title.
+    cycled = _close_tab_by_cycling(keyword, exe_name)
+    if cycled is not None:
+        return cycled
 
     if seen_titles:
         listed = ", ".join(f"'{t}'" for t in seen_titles)
@@ -1159,6 +1264,23 @@ class _BrowserSession:
             })
         return snaps
 
+    @staticmethod
+    def _text_matches(query: str, text: str) -> bool:
+        """Substring match with a token fallback.
+
+        A multi-word query like "Chat GPT" must still match a title rendered as
+        "ChatGPT" (no space). So: exact substring first, then every whitespace
+        token of the query appearing anywhere in the text.
+        """
+        text = (text or "").lower()
+        q = (query or "").lower().strip()
+        if not q:
+            return False
+        if q in text:
+            return True
+        tokens = [t for t in re.split(r"[^a-zа-яё0-9]+", q) if t]
+        return bool(tokens) and all(tok in text for tok in tokens)
+
     async def _find_page(self, query: str) -> Page | None:
         query = (query or "").strip()
         if not query:
@@ -1170,22 +1292,21 @@ class _BrowserSession:
             idx = int(query)
             if 1 <= idx <= len(pages):
                 return pages[idx - 1]
-        q = query.lower()
         title_matches: list[Page] = []
         domain_matches: list[Page] = []
         url_matches: list[Page] = []
         for p in pages:
             try:
-                title = (await p.title()).lower()
+                title = await p.title()
             except Exception:
                 title = ""
-            url = (p.url or "").lower()
-            dom = self._domain(p.url or "")
-            if q in title:
+            url = p.url or ""
+            dom = self._domain(url)
+            if self._text_matches(query, title):
                 title_matches.append(p)
-            if q in dom:
+            if self._text_matches(query, dom):
                 domain_matches.append(p)
-            if q in url:
+            if self._text_matches(query, url):
                 url_matches.append(p)
         return (title_matches or domain_matches or url_matches or [None])[0]
 
@@ -1228,7 +1349,10 @@ class _BrowserSession:
         await self._acquire()
         page = await self._find_page(query)
         if page is None:
-            return f"Could not find a tab matching '{query}'."
+            snaps = await self._snapshot_tabs()
+            names = ", ".join(s["title"] for s in snaps)
+            return (f"Could not find a tab matching '{query}'. "
+                    f"Open tabs: {names}" if names else f"Could not find a tab matching '{query}'. No tabs are open.")
         title = ""
         try:
             title = await page.title()
@@ -1501,6 +1625,7 @@ class _BrowserSession:
                 "viewport":    None,
                 "no_viewport": True,
                 "timeout":     25_000,
+                "accept_downloads": True,
             }
             if exe:
                 kwargs["executable_path"] = exe
@@ -1539,6 +1664,7 @@ class _BrowserSession:
             "viewport":    None,
             "no_viewport": True,
             "timeout":     25_000,
+            "accept_downloads": True,
             "args": [
                 "--start-maximized",
                 "--disable-blink-features=AutomationControlled",
@@ -1822,6 +1948,67 @@ class _BrowserSession:
         except Exception as e:
             return f"Reload error: {e}"
 
+    async def download(self, url: str = "", folder: str = "") -> str:
+        """Navigate to a page and click its download link/button, capturing the
+        resulting file to the Downloads folder (or ``folder``)."""
+        from actions.downloader import _downloads_dir, _sanitize
+
+        await self._acquire()
+        page = await self._get_page()
+
+        if url:
+            try:
+                await page.goto(_normalize_url(url),
+                                wait_until="domcontentloaded", timeout=30_000)
+                await asyncio.sleep(0.5)
+            except PlaywrightTimeout:
+                pass
+            except Exception as e:
+                print(f"[Browser] download goto: {e}")
+
+        dest = Path(folder) if folder else _downloads_dir()
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            dest = _downloads_dir()
+
+        selectors = (
+            'a[download]',
+            'a[href$=".exe"],a[href$=".msi"],a[href$=".msix"],a[href$=".zip"],'
+            'a[href$=".dmg"],a[href$=".pkg"],a[href$=".deb"],a[href$=".rpm"],'
+            'a[href$=".apk"],a[href$=".tar"],a[href$=".gz"],a[href$=".7z"],'
+            'a[href$=".rar"],a[href$=".iso"],a[href$=".pdf"]',
+            'button:has-text("Download")',
+            'a:has-text("Download")',
+            'button:has-text("Install")',
+            'a:has-text("Install")',
+            'button:has-text("Setup")',
+            'a:has-text("Setup")',
+            'button:has-text("Get")',
+            'a:has-text("Get")',
+        )
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                cnt = await loc.count()
+            except Exception:
+                cnt = 0
+            if cnt == 0:
+                continue
+            for i in range(min(cnt, 3)):
+                try:
+                    async with page.expect_download(timeout=45_000) as dl:
+                        await loc.nth(i).click(timeout=10_000)
+                    download = await dl.value
+                    fname = _sanitize(download.suggested_filename or "download")
+                    path = dest / fname
+                    await download.save_as(str(path))
+                    return f"Downloaded '{fname}' to {dest}."
+                except Exception as e:
+                    print(f"[Browser] download attempt {sel} #{i} failed: {e}")
+                    continue
+        return "Could not find a download link or button on that page."
+
     async def close_browser(self) -> str:
         await self._async_close()
         return f"{self.browser_name} closed."
@@ -1990,8 +2177,12 @@ def browser_control(
             if sess is not None and sess.using_cdp():
                 try:
                     result = sess.run(sess.close_tab_by_ref(tab_name))
-                    _log(player, result)
-                    return result
+                    if result.startswith("Closed"):
+                        _log(player, result)
+                        return result
+                    # CDP didn't find/close it (e.g. the tab lives in a different
+                    # browser window than the one CDP attached to) — fall through
+                    # to UI Automation instead of giving up.
                 except Exception as e:
                     print(f"[Browser] CDP close_tab failed, trying UI Automation: {e}")
 
@@ -2187,6 +2378,9 @@ def browser_control(
             result = sess.run(sess.forward())
         elif action == "reload":
             result = sess.run(sess.reload())
+        elif action == "download":
+            result = sess.run(sess.download(
+                params.get("url", ""), params.get("folder", "")))
         else:
             result = f"Unknown browser action: '{action}'"
 
