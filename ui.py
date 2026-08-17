@@ -3545,40 +3545,6 @@ def _find_splash_music() -> str:
     return ""
 
 
-def _pick_output_device_index() -> int | None:
-    """Index of a physical output device (skip SteelSeries Sonar virtual channels)."""
-    try:
-        import sounddevice as sd
-        devices = sd.query_devices()
-        hostapis = sd.query_hostapis()
-    except Exception:
-        return None
-    _skip = ("virtual", "sonar", "microphone", "mic", "chat", "stream",
-             "spdif", "digital", "переназначение")
-
-    def _physical(d):
-        if d["max_output_channels"] <= 0:
-            return False
-        name = (d["name"] or "").lower()
-        if any(b in name for b in _skip):
-            return False
-        return any(k in name for k in ("динамики", "speaker", "наушники", "headphone"))
-
-    candidates = [i for i, d in enumerate(devices) if _physical(d)]
-    if not candidates:
-        candidates = [i for i, d in enumerate(devices)
-                      if d["max_output_channels"] > 0
-                      and not any(b in (d["name"] or "").lower() for b in _skip)]
-    if not candidates:
-        return None
-    # Prefer WASAPI (cleanest Windows output), otherwise the first match.
-    for i in candidates:
-        h = int(devices[i].get("hostapi") or 0)
-        if h < len(hostapis) and "wasapi" in (hostapis[h]["name"] or "").lower():
-            return i
-    return candidates[0]
-
-
 def _decode_splash_music(path: str, seconds: float = 8.0, sample_rate: int = 44100,
                          volume: float = 1.0):
     """Decode the first `seconds` of the music to float32 PCM via ffmpeg.
@@ -3637,16 +3603,20 @@ def _load_splash_music(photo_seconds: float):
     music_path = _find_splash_music()
     if not music_path:
         return None, None, None
-    device = _pick_output_device_index()
+    # Play through the system DEFAULT output device — the same path JARVIS's
+    # voice (TTS) uses — rather than a hard-picked physical device. A physical
+    # device (e.g. Realtek "Speakers") may not be what the user actually hears
+    # when their audio routes through SteelSeries Sonar, and its index can
+    # change between reboots, silently muting the splash music.
+    device = None
     sample_rate = 44100
-    if device is not None:
-        try:
-            import sounddevice as sd
-            sr = sd.query_devices()[device].get("default_samplerate")
-            if sr:
-                sample_rate = int(float(sr))
-        except Exception:
-            pass
+    try:
+        import sounddevice as sd
+        sr = sd.query_devices(kind="output").get("default_samplerate")
+        if sr:
+            sample_rate = int(float(sr))
+    except Exception:
+        pass
     _music_tail = 5.0
     audio, rate = _decode_splash_music(
         music_path, seconds=photo_seconds + _music_tail,
@@ -3895,6 +3865,91 @@ class _CinematicSplash(QWidget):
         p.end()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  Reboot-safe splash-music playback (default output device)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Virtual audio routers present a device that is a *silent sink* until their
+# companion app starts routing (SteelSeries Sonar, VoiceMeeter, …). At login
+# JARVIS can auto-start before that app, so the music must wait for it rather
+# than playing into a dead device. Physical devices are assumed audible at once.
+_ROUTER_HINTS = (
+    ("sonar", ("steelseriessonar.exe", "steelseriesgg.exe")),
+    ("voicemeeter", ("voicemeeter.exe", "voicemeeter8.exe", "voicemeeterpro.exe")),
+    ("vb-audio", ("voicemeeter.exe", "vb_cable_controlpanel.exe")),
+    ("virtual audio cable", ("audiorepeater.exe",)),
+    ("cable input", ("vb_cable_controlpanel.exe",)),
+)
+
+
+def _splash_log(msg: str) -> None:
+    try:
+        with open(BASE_DIR / "jarvis_splash.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _any_process_running(names) -> bool:
+    try:
+        running = {p.name().lower() for p in psutil.process_iter(["name"])}
+    except Exception:
+        return True  # can't enumerate — don't block the music on it
+    return any(n in running for n in names)
+
+
+def _default_output_audible() -> bool:
+    """True when the current default output device should actually be heard."""
+    try:
+        import sounddevice as sd
+        info = sd.query_devices(kind="output")
+    except Exception:
+        return False
+    if not info:
+        return False
+    name = (info.get("name") or "").lower()
+    for hint, procs in _ROUTER_HINTS:
+        if hint in name:
+            return _any_process_running(procs)
+    return True
+
+
+def _play_splash_music(audio, rate, max_wait: float = 6.0) -> None:
+    """Play the splash music on the system default output device.
+
+    Runs on a background thread: plays immediately when the output is already
+    audible, otherwise polls until it is (or times out) so the splash animation
+    never blocks and the music still comes through after a reboot race.
+    """
+    import sounddevice as sd
+
+    def _attempt() -> bool:
+        try:
+            sd.play(audio, rate, device=None, blocksize=4096)
+            _splash_log("music started (default output)")
+            return True
+        except Exception as e:
+            try:
+                sd.play(audio, rate, device=None)
+                _splash_log("music started (default output, no blocksize)")
+                return True
+            except Exception as e2:
+                _splash_log(f"music play failed: {e2}")
+                return False
+
+    if _default_output_audible() and _attempt():
+        return
+
+    _splash_log("waiting for the default output to become audible…")
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        time.sleep(0.4)
+        if _default_output_audible() and _attempt():
+            return
+
+    _attempt()  # final best-effort (a physical device may still be fine)
+
+
 def _show_startup_splash(image_path: str, seconds: float = _SPLASH_TOTAL, music=None) -> None:
     """Cinematic boot: fullscreen Tony Stark photo + HUD, cross-fading into JARVIS.
 
@@ -3905,29 +3960,21 @@ def _show_startup_splash(image_path: str, seconds: float = _SPLASH_TOTAL, music=
     if not image_path or not Path(image_path).exists():
         return
 
-    audio, rate, device = music if music else (None, None, None)
+    audio, rate, _device = music if music else (None, None, None)
 
     try:
-        import sounddevice as sd
-
         pm = QPixmap(image_path)
         if pm.isNull():
             return
 
-        # Music plays on sounddevice's own thread — non-blocking, so it can't
+        # Music plays on a background thread (non-blocking), so it can't
         # deadlock the animation loop the way Qt Multimedia/FFmpeg once did.
         # A large blocksize makes playback tolerant of the CPU spikes the
         # splash animation causes (prevents audio underruns / stutter).
         if audio is not None and rate is not None:
-            try:
-                sd.play(audio, rate, device=device, blocksize=4096)
-            except Exception as e:
-                print(f"[UI] music play failed with blocksize: {e}")
-                try:
-                    sd.play(audio, rate, device=device)
-                except Exception as e2:
-                    print(f"[UI] music play failed: {e2}")
-                    audio = None
+            threading.Thread(
+                target=_play_splash_music, args=(audio, rate), daemon=True
+            ).start()
 
         splash = _CinematicSplash(pm)
 

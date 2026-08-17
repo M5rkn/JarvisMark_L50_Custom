@@ -68,14 +68,17 @@ skill.tools = [
     Tool(
         name="open_app",
         description=(
-            "Opens any application on the computer. "
-            "Use this whenever the user asks to open, launch, or start any app, "
-            "website, or program. Always call this tool — never just say you opened it."
+            "Opens any application, website, or system settings dialog on the computer. "
+            "Use this whenever the user asks to open, launch, or start any app, website, "
+            "program, or settings window (e.g. 'Settings', 'Power management', 'Power "
+            "options', 'Device manager', 'Network connections', 'Control panel', "
+            "'Wi-Fi settings', 'Bluetooth settings'). Always call this tool — never just "
+            "say you opened it."
         ),
         parameters={
             "type": "OBJECT",
             "properties": {
-                "app_name": {"type": "STRING", "description": "Exact name of the application (e.g. 'WhatsApp', 'Chrome', 'Spotify')"}
+                "app_name": {"type": "STRING", "description": "Exact name of the application or settings page (e.g. 'WhatsApp', 'Chrome', 'Spotify', 'power management', 'device manager', 'network connections')"}
             },
             "required": ["app_name"],
         },
