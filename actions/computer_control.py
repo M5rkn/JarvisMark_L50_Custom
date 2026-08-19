@@ -39,7 +39,6 @@ def _base_dir() -> Path:
 
 _BASE         = _base_dir()
 _CONFIG_PATH  = _BASE / "config" / "api_keys.json"
-_MEMORY_PATH  = _BASE / "memory" / "long_term.json"
 
 def _load_config() -> dict:
     try:
@@ -146,12 +145,14 @@ def _random_data(data_type: str) -> str:
     return f"random_{data_type}_{random.randint(1000, 9999)}"
 
 def _user_profile() -> dict:
-    """Read identity fields from long-term memory."""
+    """Read identity fields from layered long-term memory."""
     try:
-        if _MEMORY_PATH.exists():
-            data     = json.loads(_MEMORY_PATH.read_text(encoding="utf-8"))
-            identity = data.get("identity", {})
-            return {k: v.get("value", "") for k, v in identity.items()}
+        from memory.memory_manager import load_memory
+        identity = load_memory().get("identity", {})
+        return {
+            k: (v.get("value", "") if isinstance(v, dict) else v)
+            for k, v in identity.items()
+        }
     except Exception:
         pass
     return {}
@@ -312,7 +313,7 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
-def _screen_find(description: str) -> tuple[int, int] | None:
+def _screen_find(description: str) -> tuple[int, int, float] | None:
     api_key = _get_api_key()
     if not api_key:
         print("[ComputerControl] ⚠️ No API key for screen_find")
@@ -333,8 +334,9 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         prompt = (
             f"This is a screenshot of a {w}×{h} pixel screen. "
             f"Locate the UI element described as: '{description}'. "
-            f"Reply with ONLY the center coordinates as: x,y "
-            f"If the element is not visible, reply: NOT_FOUND"
+            "Reply ONLY with JSON: {\"x\": integer, \"y\": integer, \"confidence\": 0.0-1.0}. "
+            "Use a confidence below 0.85 if there is any ambiguity, multiple matches, or the element is partly obscured. "
+            "If the element is not visible, reply: NOT_FOUND"
         )
 
         response = client.models.generate_content(
@@ -349,9 +351,13 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         if "NOT_FOUND" in text.upper():
             return None
 
-        match = re.search(r"(\d+)\s*,\s*(\d+)", text)
+        match = re.search(r"\{.*?\}", text, re.DOTALL)
         if match:
-            return int(match.group(1)), int(match.group(2))
+            data = json.loads(match.group())
+            x, y = int(data["x"]), int(data["y"])
+            confidence = float(data.get("confidence", 0.0))
+            if 0 <= x < w and 0 <= y < h and 0.0 <= confidence <= 1.0:
+                return x, y, confidence
 
     except Exception as e:
         print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
@@ -470,16 +476,18 @@ def computer_control(
             return _screenshot(params.get("path"))
 
         if action == "screen_find":
-            coords = _screen_find(params.get("description", ""))
-            return f"{coords[0]},{coords[1]}" if coords else "NOT_FOUND"
+            match = _screen_find(params.get("description", ""))
+            return f"{match[0]},{match[1]} confidence={match[2]:.2f}" if match else "NOT_FOUND"
 
         if action == "screen_click":
             desc   = params.get("description", "")
-            coords = _screen_find(desc)
-            if coords:
+            match = _screen_find(desc)
+            if match and match[2] >= 0.85:
                 time.sleep(0.2)
-                _click(x=coords[0], y=coords[1])
-                return f"Clicked '{desc}' at {coords}"
+                _click(x=match[0], y=match[1])
+                return f"Clicked '{desc}' at ({match[0]}, {match[1]}) with confidence {match[2]:.2f}"
+            if match:
+                return f"Refused to click '{desc}': visual confidence {match[2]:.2f} is below 0.85."
             return f"Element not found on screen: '{desc}'"
 
         if action == "wait":

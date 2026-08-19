@@ -154,18 +154,21 @@ skill.tools = [
         name="game_updater",
         description=(
             "THE ONLY tool for ANY Steam or Epic Games request. "
-            "Use for: installing, downloading, updating games, listing installed games, "
-            "checking download status, scheduling updates. "
+            "Use for: LAUNCHING/opening/playing games, installing, downloading, "
+            "updating games, listing installed games, checking download status, "
+            "scheduling updates, and closing or restarting Steam itself. "
+            "To OPEN / LAUNCH / PLAY a game (e.g. 'open PUBG', 'запусти игру'), "
+            "call with action='launch' and game_name=<game>. "
             "ALWAYS call directly for any Steam/Epic/game request. "
-            "NEVER use browser_control or web_search for Steam/Epic."
+            "NEVER use browser_control, web_search, or open_app for Steam/Epic games."
         ),
         parameters={
             "type": "OBJECT",
             "properties": {
-                "action":    {"type": "STRING",  "description": "update | install | list | download_status | schedule | cancel_schedule | schedule_status (default: update)"},
+                "action":    {"type": "STRING",  "description": "launch | update | install | list | download_status | schedule | cancel_schedule | schedule_status | close | restart (default: update). 'launch' opens/plays a game by name or app_id; 'close'/'restart' act on Steam itself"},
                 "platform":  {"type": "STRING",  "description": "steam | epic | both (default: both)"},
-                "game_name": {"type": "STRING",  "description": "Game name (partial match supported)"},
-                "app_id":    {"type": "STRING",  "description": "Steam AppID for install (optional)"},
+                "game_name": {"type": "STRING",  "description": "Game name (partial match supported). Required for launch/install."},
+                "app_id":    {"type": "STRING",  "description": "Steam AppID for install/launch (optional; use game_name instead when possible)"},
                 "hour":      {"type": "INTEGER", "description": "Hour for scheduled update 0-23 (default: 3)"},
                 "minute":    {"type": "INTEGER", "description": "Minute for scheduled update 0-59 (default: 0)"},
                 "shutdown_when_done": {"type": "BOOLEAN", "description": "Shut down PC when download finishes"},

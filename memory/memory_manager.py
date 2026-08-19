@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from threading import Lock
-from pathlib import Path
 import sys
+import threading
+from pathlib import Path
+
+# Avoid UnicodeEncodeError on Windows consoles (cp1251/cp866): emoji and other
+# non-ASCII in print() must never crash the app — replace undecodable chars.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 
 def get_base_dir() -> Path:
@@ -13,11 +20,15 @@ def get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-BASE_DIR         = get_base_dir()
-MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
-_lock            = Lock()
-MAX_VALUE_LENGTH = 380
-MEMORY_MAX_CHARS = 2200
+BASE_DIR     = get_base_dir()
+MEMORY_PATH  = BASE_DIR / "memory" / "long_term.json"     # legacy flat store (migrated once)
+MONITORS_PATH = BASE_DIR / "memory" / "store" / "monitors.json"  # background-monitor state
+
+_lock         = threading.Lock()        # guards monitor-file writes (legacy consumers)
+_migrate_lock = threading.Lock()        # guards the one-time flat→layered migration
+
+_CATEGORIES = ("identity", "preferences", "projects", "relationships", "wishes", "notes")
+
 
 def _empty_memory() -> dict:
     return {
@@ -29,95 +40,207 @@ def _empty_memory() -> dict:
         "notes":         {},
     }
 
-def load_memory() -> dict:
-    if not MEMORY_PATH.exists():
-        return _empty_memory()
-    with _lock:
+
+# ── One-time migration: legacy flat long_term.json → layered store ────────────
+
+def migrate_legacy_flat() -> int:
+    """
+    One-time import of the legacy flat ``long_term.json`` into the layered store.
+
+    * Facts (identity/preferences/projects/relationships/wishes/notes) are copied
+      into the ``long_term`` layer, but only when that ``(category, key)`` is not
+      already present — the layered store is authoritative, so we never overwrite
+      a newer value with an older flat one.
+    * Sessions are copied into the ``episodic`` layer only if no session entry
+      already exists there (the episodic store already supersedes the flat list).
+    * Monitors are moved to their dedicated state file ``memory/store/monitors.json``.
+
+    On success the flat file is renamed to ``long_term.json.bak`` so it is never
+    read again. Returns the number of entries migrated.
+    """
+    with _migrate_lock:
+        if not MEMORY_PATH.exists():
+            return 0
+
+        migrated = 0
+        migration_complete = True
         try:
             data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                base = _empty_memory()
-                for key in base:
-                    if key not in data:
-                        data[key] = {}
-                return data
-            return _empty_memory()
+            if not isinstance(data, dict):
+                data = {}
+
+            from memory.layered_memory import add_memory, get_layer, record_session
+
+            existing = get_layer("long_term")
+            existing_keys = set()
+            for e in existing:
+                labels = e.get("labels") or []
+                if len(labels) >= 2:
+                    existing_keys.add((labels[0], labels[1]))
+
+            for cat in _CATEGORIES:
+                items = data.get(cat)
+                if not isinstance(items, dict):
+                    continue
+                for key, entry in items.items():
+                    if (cat, str(key)) in existing_keys:
+                        continue          # already in layered — keep the newer value
+                    val = entry.get("value") if isinstance(entry, dict) else entry
+                    if val is None or not str(val).strip():
+                        continue
+                    try:
+                        add_memory(
+                            content=f"{str(key).replace('_', ' ')}: {val}",
+                            layer="long_term", labels=[cat, str(key)],
+                            source="migration", embed_async=False,
+                        )
+                        migrated += 1
+                    except Exception as e:
+                        print(f"[Memory] ⚠️ migrate {cat}/{key}: {e}")
+                        migration_complete = False
+
+            # Sessions → episodic (only if episodic has no session entries yet).
+            sessions = data.get("sessions")
+            if isinstance(sessions, list):
+                has_session = any(
+                    e.get("kind") == "session" for e in get_layer("episodic")
+                )
+                if not has_session:
+                    for s in sessions:
+                        if isinstance(s, dict) and s.get("summary"):
+                            try:
+                                record_session(str(s["summary"]), str(s.get("language", "")))
+                                migrated += 1
+                            except Exception as e:
+                                print(f"[Memory] ⚠️ migrate session: {e}")
+                                migration_complete = False
+
+            # Monitors → dedicated state file.
+            monitors = data.get("monitors")
+            if isinstance(monitors, dict) and monitors:
+                _migrate_monitors(monitors)
         except Exception as e:
-            print(f"[Memory] ⚠️ Load error: {e}")
-            return _empty_memory()
+            print(f"[Memory] ⚠️ migration error: {e}")
+            return migrated
 
-def _all_entries(memory: dict) -> list[tuple]:
-    entries = []
-    for cat, items in memory.items():
-        if not isinstance(items, dict):
-            continue
-        for key, entry in items.items():
-            if isinstance(entry, dict) and "value" in entry:
-                entries.append((cat, key, entry))
-    return entries
+        if not migration_complete:
+            print("[Memory] ⚠️ migration incomplete; preserving legacy file for retry")
+            return migrated
+
+        try:
+            MEMORY_PATH.replace(MEMORY_PATH.with_name("long_term.json.bak"))
+            print(f"[Memory] ✅ Migrated {migrated} legacy entries → layered store (long_term.json → .bak)")
+        except Exception as e:
+            print(f"[Memory] ⚠️ could not rename legacy file: {e}")
+        return migrated
 
 
-def _trim_to_limit(memory: dict) -> dict:
-    if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
-        return memory
-    entries = _all_entries(memory)
-    entries.sort(key=lambda t: t[2].get("updated", "0000-00-00"))
-    for cat, key, _ in entries:
-        if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
-            break
-        del memory[cat][key]
-        print(f"[Memory] 🗑️  Trimmed {cat}/{key}")
-    return memory
-
-def save_memory(memory: dict) -> None:
-    if not isinstance(memory, dict):
+def _migrate_monitors(monitors: dict) -> None:
+    if MONITORS_PATH.exists():
         return
-    memory = _trim_to_limit(memory)
-    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MONITORS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MONITORS_PATH.write_text(
+        json.dumps(monitors, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+# ── Monitor state (dedicated file, not memory) ────────────────────────────────
+
+def load_monitors() -> dict:
+    if not MONITORS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(MONITORS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[Memory] ⚠️ load monitors error: {e}")
+        return {}
+
+
+def save_monitors(monitors: dict) -> None:
+    MONITORS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        MONITORS_PATH.write_text(
+            json.dumps(monitors, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
 
-def _truncate_value(val: str) -> str:
-    if isinstance(val, str) and len(val) > MAX_VALUE_LENGTH:
-        return val[:MAX_VALUE_LENGTH].rstrip() + "…"
-    return val
+# ── Layered-backed flat view ───────────────────────────────────────────────────
+
+def _flat_view_from_layered() -> dict:
+    """Reconstruct the legacy flat structure from the layered long_term layer.
+
+    Only ``category/key: value`` facts (labels = [category, key]) are mapped back;
+    free-text facts remain available via the layered ``format_layered_memory_context``.
+    """
+    view = _empty_memory()
+    try:
+        from memory.layered_memory import get_layer
+        for e in get_layer("long_term"):
+            labels = e.get("labels") or []
+            if len(labels) < 2 or labels[0] not in _CATEGORIES or not labels[1]:
+                continue
+            cat, key = labels[0], labels[1]
+            content = e.get("content") or ""
+            prefix = f"{str(key).replace('_', ' ')}: "
+            value = content[len(prefix):] if content.lower().startswith(prefix.lower()) else content
+            view[cat][str(key)] = {
+                "value": str(value),
+                "updated": (e.get("updated") or "")[:10],
+            }
+    except Exception as e:
+        print(f"[Memory] ⚠️ flat view failed: {e}")
+    return view
 
 
-def _recursive_update(target: dict, updates: dict) -> bool:
-    changed = False
-    for key, value in updates.items():
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        if isinstance(value, dict) and "value" not in value:
-            if key not in target or not isinstance(target[key], dict):
-                target[key] = {}
-                changed = True
-            if _recursive_update(target[key], value):
-                changed = True
-        else:
-            new_val  = _truncate_value(str(value["value"] if isinstance(value, dict) else value))
-            entry    = {"value": new_val, "updated": datetime.now().strftime("%Y-%m-%d")}
-            existing = target.get(key, {})
-            if not isinstance(existing, dict) or existing.get("value") != new_val:
-                target[key] = entry
-                changed = True
-    return changed
+def load_memory() -> dict:
+    """
+    Return the memory dict backed by the layered store (single source of truth).
+
+    Triggers a one-time migration of the legacy flat ``long_term.json`` on first
+    use, then reconstructs the flat view from the layered ``long_term`` layer for
+    backward-compatible callers.
+    """
+    migrate_legacy_flat()
+    view = _flat_view_from_layered()
+    view["sessions"]  = []
+    view["monitors"]  = load_monitors()
+    return view
+
+
+def save_memory(memory: dict) -> None:
+    """Persist a full flat memory dict to the layered store."""
+    update_memory(memory)
 
 
 def update_memory(memory_update: dict) -> dict:
+    """Write flat ``{category: {key: {"value": ...}}}`` facts into the layered store."""
     if not isinstance(memory_update, dict) or not memory_update:
         return load_memory()
-    memory = load_memory()
-    if _recursive_update(memory, memory_update):
-        save_memory(memory)
+
+    from memory.layered_memory import add_memory
+    changed = False
+    for category, items in memory_update.items():
+        if not isinstance(items, dict):
+            continue
+        for key, val in items.items():
+            value = val.get("value") if isinstance(val, dict) else val
+            if value is None or not str(value).strip():
+                continue
+            try:
+                add_memory(
+                    content=f"{str(key).replace('_', ' ')}: {value}",
+                    layer="long_term", labels=[str(category), str(key)],
+                    source="auto", embed_async=True,
+                )
+                changed = True
+            except Exception as e:
+                print(f"[Memory] ⚠️ update_memory {category}/{key}: {e}")
+
+    if changed:
         print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
-    return memory
+    return load_memory()
+
 
 def format_memory_for_prompt(memory: dict | None) -> str:
     if not memory:
@@ -195,6 +318,7 @@ def format_memory_for_prompt(memory: dict | None) -> str:
 
     return result + "\n"
 
+
 def remember(key: str, value: str, category: str = "notes") -> str:
     valid = {"identity", "preferences", "projects", "relationships", "wishes", "notes"}
     if category not in valid:
@@ -204,12 +328,16 @@ def remember(key: str, value: str, category: str = "notes") -> str:
 
 
 def forget(key: str, category: str = "notes") -> str:
-    memory = load_memory()
-    cat    = memory.get(category, {})
-    if key in cat:
-        del cat[key]
-        memory[category] = cat
-        save_memory(memory)
+    from memory.layered_memory import get_layer, forget as _forget
+    entries = get_layer("long_term")
+    target = None
+    for e in entries:
+        labels = e.get("labels") or []
+        if len(labels) >= 2 and labels[0] == category and labels[1] == str(key):
+            target = e
+            break
+    if target is not None:
+        _forget(target["id"], "long_term")
         return f"Forgotten: {category}/{key}"
     return f"Not found: {category}/{key}"
 
@@ -219,66 +347,34 @@ forget_memory = forget
 
 # ── Session memory ─────────────────────────────────────────────────────────────
 
-_SESSION_MAX = 3   # safety cap — in practice 0-1 entries after pop
-
-
 def save_session_summary(summary: str, language: str = "") -> None:
-    """Append a 1-2 sentence session summary to long_term.json['sessions']."""
+    """Persist a session summary to the episodic layer (single source of truth)."""
+    from memory.layered_memory import record_session
     summary = (summary or "").strip()
-    if not summary:
-        return
-    memory   = load_memory()
-    sessions = memory.get("sessions", [])
-    if not isinstance(sessions, list):
-        sessions = []
-    entry: dict = {
-        "date":    datetime.now().strftime("%Y-%m-%d"),
-        "summary": summary[:280],
-    }
-    if language:
-        entry["language"] = language
-    sessions.append(entry)
-    memory["sessions"] = sessions[-_SESSION_MAX:]
-    with _lock:
-        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
+    if summary:
+        record_session(summary, language)
 
 
 def pop_last_session() -> dict | None:
-    """
-    Return AND remove the most recent session entry.
-    Calling this consumes the entry so it is never repeated in future briefings.
-    """
-    with _lock:
-        if not MEMORY_PATH.exists():
-            return None
-        try:
-            memory   = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            sessions = memory.get("sessions", [])
-            if not isinstance(sessions, list) or not sessions:
-                return None
-            entry = sessions.pop()          # remove the last entry
-            memory["sessions"] = sessions
-            MEMORY_PATH.write_text(
-                json.dumps(memory, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            return entry
-        except Exception as e:
-            print(f"[Memory] ⚠️ pop_last_session error: {e}")
-            return None
+    """Return AND remove the most recent episodic session entry (consume-once)."""
+    from memory.layered_memory import get_layer, forget as _forget
+    entries = [e for e in get_layer("episodic") if e.get("kind") == "session"]
+    if not entries:
+        return None
+    entries.sort(key=lambda e: e.get("created", "") or "")
+    last = entries[-1]
+    _forget(last["id"], "episodic")
+    return {
+        "date":    last.get("date", ""),
+        "summary": last.get("content", ""),
+        "language": "",
+    }
 
 
 # ── Multi-layer structured memory bridge ───────────────────────────────────────
-# The layered engine (memory/layered_memory.py) adds short-term / long-term /
-# project / episodic layers with semantic search, dedup and automatic update of
-# outdated facts. These thin wrappers keep that system reachable without the
-# legacy callers needing to know about it, and without breaking anything that
-# still reads the flat long_term.json categories above.
+# The layered engine (memory/layered_memory.py) is the single source of truth for
+# short-term / long-term / project / episodic memory. These thin wrappers expose
+# it without the legacy callers needing to know the internals.
 
 def search_memory(query: str, layers=None, top_k: int = 5) -> list[dict]:
     """Semantic/context search across the layered store."""
@@ -313,6 +409,16 @@ def record_session_event(summary: str, language: str = "") -> dict:
     """Persist a session summary into the episodic layer."""
     from memory.layered_memory import record_session
     return record_session(summary, language)
+
+
+def record_project_fact(content: str, labels: list[str] | None = None,
+                        kind: str = "decision") -> dict:
+    """Persist a technical / project fact into the project layer."""
+    from memory.layered_memory import add_memory
+    return add_memory(
+        content=content, layer="project", labels=labels, kind=kind,
+        importance=0.7, source="auto",
+    )
 
 
 def format_layered_memory_context(max_chars: int = 1800) -> str:

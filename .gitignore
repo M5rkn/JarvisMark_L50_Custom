@@ -17,6 +17,7 @@ dist/
 # ── Secrets & personal data — DO NOT COMMIT ──────────────────────────────
 config/api_keys.json
 memory/long_term.json
+memory/long_term.json.bak
 memory/store/
 
 # ── TLS private keys / certificates ──────────────────────────────────────

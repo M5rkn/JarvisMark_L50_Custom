@@ -37,7 +37,8 @@ else:
     _WIN_HIDE: dict = {}
 
 from PyQt6.QtCore import (
-    QAbstractNativeEventFilter, QPointF, QRectF, Qt, QTimer, pyqtSignal,
+    QAbstractNativeEventFilter, QEventLoop, QPointF, QRectF, Qt, QTimer,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
@@ -60,6 +61,7 @@ def _base_dir() -> Path:
 BASE_DIR   = _base_dir()
 CONFIG_DIR = BASE_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
+_KEYFILE   = CONFIG_DIR / ".keyfile"
 
 
 def _read_full_config() -> dict:
@@ -561,7 +563,8 @@ class JarvisCore(QWidget):
     def __init__(self, face_path: str = "", assistant_name: str = "JARVIS",
                  parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        # Translucent so the ambient Stark backdrop (central widget) shows
+        # through behind the sphere instead of painting an opaque slab.
         self.setMinimumSize(320, 320)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -571,7 +574,7 @@ class JarvisCore(QWidget):
         self._assistant_name = assistant_name
 
         self._t          = 0.0
-        self._last_t     = time.time()
+        self._last_t     = time.monotonic()
         self._breathe    = 0.0
         self._glow       = 30.0
         self._pulse      = 0.0
@@ -587,9 +590,19 @@ class JarvisCore(QWidget):
         if face_path:
             self._load_face(face_path)
 
+        # Cached translucent background+halo layer. It changes only on resize or
+        # state change (muted/speaking/state → accent + activity), not every
+        # frame, so it is rasterised lazily and blitted per frame instead of
+        # running two full-widget gradient fills at 60 fps.
+        self._bg_layer = None
+        self._bg_key = None
+        self._name_font = None
+        self._status_font = None
+        self._name_fs_cache = -1
+
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(80)
+        self._tmr.start(33)
 
     def pause_animation(self) -> None:
         """Freeze the neural-core animation (used during the startup splash)."""
@@ -598,7 +611,7 @@ class JarvisCore(QWidget):
     def resume_animation(self) -> None:
         """Restart the neural-core animation after it was paused."""
         if not self._tmr.isActive():
-            self._last_t = time.time()
+            self._last_t = time.monotonic()
             self._tmr.start()
 
     def _load_face(self, path: str):
@@ -624,6 +637,8 @@ class JarvisCore(QWidget):
             return C.MUTED_C
         if self.speaking:
             return C.PRI
+        if self.state == "INTERRUPTED":
+            return C.ACC
         if self.state in ("THINKING", "PROCESSING"):
             return C.ACC2
         return C.PRI
@@ -631,6 +646,8 @@ class JarvisCore(QWidget):
     def _activity(self) -> float:
         if self.speaking:
             return 1.0
+        if self.state == "INTERRUPTED":
+            return 0.70
         if self.state in ("THINKING", "PROCESSING"):
             return 0.55
         if self.state == "LISTENING":
@@ -650,14 +667,46 @@ class JarvisCore(QWidget):
             return "PROCESSING", C.ACC2
         if self.state == "LISTENING":
             return "LISTENING", C.PRI
+        if self.state == "IDLE":
+            return "IDLE", C.PRI
+        if self.state == "INTERRUPTED":
+            return "INTERRUPTED", C.ACC
         if self.state == "SLEEPING":
             return "STANDBY", C.TEXT_DIM
         if self.state == "INITIALISING":
             return "INITIALISING", C.PRI_DIM
         return "STANDBY", C.PRI_DIM
 
+    def _render_bg_layer(self, W: int, H: int, cx: float, cy: float,
+                         fw: float, acc: str, act: float) -> QPixmap:
+        """Rasterise the translucent background + halo into one pixmap.
+
+        Both are static between state changes (they depend only on the accent
+        and activity, not on the per-frame glow/breathing), so this runs only on
+        resize or state change.
+        """
+        layer = QPixmap(W, H)
+        layer.fill(Qt.GlobalColor.transparent)
+        p = QPainter(layer)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # background — translucent so the ambient Stark photo stays visible
+        bg = QLinearGradient(0, 0, 0, H)
+        bg.setColorAt(0.0, QColor(12, 16, 20, 175))
+        bg.setColorAt(1.0, QColor(7, 9, 11, 190))
+        p.fillRect(QRectF(0, 0, W, H), QBrush(bg))
+
+        # halo
+        halo = QRadialGradient(cx, cy, fw * 0.62)
+        halo.setColorAt(0.0, qcol(acc, int(18 + 26 * act)))
+        halo.setColorAt(1.0, qcol(acc, 0))
+        p.fillRect(QRectF(0, 0, W, H), QBrush(halo))
+
+        p.end()
+        return layer
+
     def _step(self):
-        now = time.time()
+        now = time.monotonic()
         dt  = max(0.0, min(0.05, now - self._last_t))
         self._last_t = now
         self._t      += dt
@@ -678,35 +727,39 @@ class JarvisCore(QWidget):
             tgt = 26.0 + 5.0 * math.sin(self._t * 1.4)
         self._glow += (tgt - self._glow) * (1.0 - math.exp(-dt * 5.0))
 
-        # Adaptive frame rate: ~30 fps while active, a relaxed ~10 fps when idle.
-        target = 33 if (act > 0.20 or self.speaking) else 100
+        # Adaptive frame rate: ~60 fps while active, a relaxed ~20 fps when idle.
+        target = 16 if (act > 0.20 or self.speaking) else 50
         if self._tmr.interval() != target:
             self._tmr.setInterval(target)
 
         self.update()
 
     def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         W, H = self.width(), self.height()
+        if W <= 0 or H <= 0:
+            return
         cx, cy = W / 2, H / 2
         fw = min(W, H)
         act  = self._activity()
         glow = self._glow
         acc  = self._accent()
 
-        # background
-        bg = QLinearGradient(0, 0, 0, H)
-        bg.setColorAt(0.0, QColor("#0c1014"))
-        bg.setColorAt(1.0, QColor("#07090b"))
-        p.fillRect(self.rect(), QBrush(bg))
+        # Background + halo are cached — they change only on resize or state
+        # change, not every frame.
+        key = (W, H, acc, act)
+        if self._bg_layer is None or self._bg_key != key:
+            self._bg_layer = self._render_bg_layer(W, H, cx, cy, fw, acc, act)
+            self._bg_key = key
 
-        # halo
-        halo = QRadialGradient(cx, cy, fw * 0.62)
-        halo.setColorAt(0.0, qcol(acc, int(18 + 26 * act)))
-        halo.setColorAt(1.0, qcol(acc, 0))
-        p.fillRect(self.rect(), QBrush(halo))
+        # Fonts are cached per size (font lookup is comparatively expensive).
+        if self._name_fs_cache != fw:
+            self._name_fs_cache = fw
+            self._name_font = QFont(_UI_FONT, max(13, int(fw * 0.060)), QFont.Weight.Bold)
+            self._status_font = QFont(_UI_FONT, 10, QFont.Weight.Light)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.drawPixmap(0, 0, self._bg_layer)
 
         core_r = fw * (0.16 + 0.012 * math.sin(self._breathe * 1.4))
 
@@ -732,8 +785,7 @@ class JarvisCore(QWidget):
         p.drawEllipse(QPointF(cx, cy), core_r * 2.2, core_r * 2.2)
 
         # assistant name
-        name_fs = max(13, int(fw * 0.060))
-        p.setFont(QFont(_UI_FONT, name_fs, QFont.Weight.Bold))
+        p.setFont(self._name_font)
         p.setPen(QPen(qcol(C.WHITE, 235), 1))
         p.drawText(QRectF(cx - core_r * 1.7, cy - core_r * 0.60,
                           core_r * 3.4, core_r * 1.2),
@@ -742,7 +794,7 @@ class JarvisCore(QWidget):
         # status label
         txt, col = self._status_label()
         sy = cy + fw * 0.44
-        p.setFont(QFont(_UI_FONT, 10, QFont.Weight.Light))
+        p.setFont(self._status_font)
         p.setPen(QPen(qcol(col, 210), 1))
         p.drawText(QRectF(0, sy, W, 22), Qt.AlignmentFlag.AlignCenter, txt)
 
@@ -861,6 +913,14 @@ class ActivityPanel(QWidget):
             row.addStretch(1)
 
         self._list.insertLayout(self._list.count() - 1, row)
+        # Keep at most 200 bubbles to prevent memory growth in long sessions
+        if self._list.count() > 201:  # +1 for the trailing stretch
+            item = self._list.takeAt(0)
+            if item and item.layout():
+                while item.layout().count():
+                    w = item.layout().takeAt(0).widget()
+                    if w:
+                        w.deleteLater()
         QTimer.singleShot(0, self._scroll_bottom)
 
     def _scroll_bottom(self):
@@ -880,7 +940,7 @@ class MicrophoneButton(QPushButton):
         self.setToolTip("Toggle microphone")
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._tick)
-        self._tmr.start(80)
+        self._tmr.start(33)
 
     def set_muted(self, muted: bool):
         self._muted = muted
@@ -891,7 +951,7 @@ class MicrophoneButton(QPushButton):
         self.update()
 
     def _tick(self):
-        self._pulse = (self._pulse + 0.08) % (2 * math.pi)
+        self._pulse = (self._pulse + 0.033) % (2 * math.pi)
         if not self._muted:
             self.update()
 
@@ -1411,7 +1471,7 @@ class SetupOverlay(QWidget):
         key = self._key_input.text().strip()
         if not key:
             self._key_input.setStyleSheet(
-                self._key_input.styleSheet() + f" QLineEdit {{ border: 1px solid {C.RED}; }}")
+                f"QLineEdit {{ border: 1px solid {C.RED}; }}")
             return
         self.done.emit(key, self._sel_os)
 
@@ -2096,8 +2156,10 @@ class MainWindow(QMainWindow):
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
 
-        central = QWidget()
-        central.setStyleSheet(f"background: {C.BG};")
+        _splash_img = BASE_DIR / "splash.png"
+        if not _splash_img.exists():
+            _splash_img = BASE_DIR / "face.png"
+        central = _HudRoot(str(_splash_img) if _splash_img.exists() else "")
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
@@ -2762,7 +2824,7 @@ class MainWindow(QMainWindow):
             self._apply_state("MUTED")
             self._activity.append_log("SYS: Microphone muted.")
         else:
-            self._apply_state("LISTENING")
+            self._apply_state("IDLE")
             self._activity.append_log("SYS: Microphone active.")
 
     def _apply_state(self, state: str):
@@ -2794,8 +2856,14 @@ class MainWindow(QMainWindow):
 
     def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
+        try:
+            from core.crypto import encrypt_api_key, invalidate_api_key_cache
+            stored_key = encrypt_api_key(key, _KEYFILE)
+            invalidate_api_key_cache()
+        except Exception:
+            stored_key = key
         API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
+            json.dumps({"gemini_api_key": stored_key, "os_system": os_name}, indent=4),
             encoding="utf-8")
         self._ready = True
         if self._overlay:
@@ -2857,7 +2925,7 @@ class MainWindow(QMainWindow):
                 return
             for _ in range(5):
                 cap.read()
-            while not self._cam_stop.wait(0.033) and cap.isOpened():
+            while not self._cam_stop.wait(0.067) and cap.isOpened():  # ~15 fps preview
                 ret, frame = cap.read()
                 if ret and frame is not None:
                     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
@@ -3661,6 +3729,20 @@ def _splash_window_alpha(elapsed: float, total: float) -> float:
     return 1.0 - _smoothstep(k)
 
 
+def _blit_scrolling_scanlines(p: QPainter, px: QPixmap, w: int, h: int, y_off: int) -> None:
+    """Blit a pre-rendered scanline layer with a vertical scroll offset.
+
+    Replaces a per-row ``drawLine`` loop (hundreds of QPainter calls/frame) with
+    at most two cheap 1:1 blits. ``y_off`` is in [0, line_spacing).
+    """
+    if y_off <= 0:
+        p.drawPixmap(0, 0, px)
+        return
+    # Scroll down by y_off: bottom rows wrap around to the top.
+    p.drawPixmap(0, y_off, px, 0, 0, w, h - y_off)
+    p.drawPixmap(0, 0, px, 0, h - y_off, w, y_off)
+
+
 class _CinematicSplash(QWidget):
     """Fullscreen boot overlay: Tony Stark image + blue/cyan HUD + boot log.
 
@@ -3706,6 +3788,16 @@ class _CinematicSplash(QWidget):
         self._title_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
         self._mono_font  = QFont(_MONO_FONT, 11)
         self._mono_small = QFont(_MONO_FONT, 9)
+        self._mono_fm    = QFontMetrics(self._mono_font)
+
+        # Cached layers. The photo zoom/drift and the static HUD (vignette,
+        # brackets, title) are re-rasterised only on resize or every ~100 ms —
+        # the per-frame paint then just blits them instead of smooth-scaling a
+        # fullscreen photo and re-filling fullscreen gradients every frame.
+        self._bg_cache = None
+        self._bg_cache_size = (-1, -1)
+        self._bg_cache_t = -1.0
+        self._scan_px = None
 
     def set_time(self, t: float) -> None:
         self._t = max(0.0, float(t))
@@ -3718,17 +3810,33 @@ class _CinematicSplash(QWidget):
             return 0.0
         return min(1.0, t / reveal)
 
-    def paintEvent(self, event):
-        p = QPainter(self)
+    def _make_scanline_px(self, w: int, h: int) -> QPixmap:
+        """Pre-render the CRT scanline layer (one cyan line every 4 px)."""
+        px = QPixmap(w, h)
+        px.fill(Qt.GlobalColor.transparent)
+        sp = QPainter(px)
+        sp.setPen(QPen(QColor(120, 200, 255, 32), 1))
+        y = 0
+        while y < h:
+            sp.drawLine(0, y, w, y)
+            y += 4
+        sp.end()
+        return px
+
+    def _render_backdrop(self, w: int, h: int, t: float) -> QPixmap:
+        """Rasterise the photo + vignette + brackets + title into one pixmap.
+
+        The Ken Burns zoom is monotonic and slow (0→7% over the whole splash),
+        so re-rendering every ~100 ms is imperceptible; the per-frame paint then
+        becomes a single 1:1 blit instead of a fullscreen smooth-scale + gradient
+        fills.
+        """
+        cache = QPixmap(w, h)
+        cache.fill(QColor("#05080c"))
+        p = QPainter(cache)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-
-        w, h = self.width(), self.height()
-        if w <= 0 or h <= 0:
-            p.end()
-            return
         cx, cy = w / 2.0, h / 2.0
-        t = self._t
         margin = 24
 
         # 1) Tony Stark image — subtle zoom + slow parallax drift.
@@ -3748,17 +3856,56 @@ class _CinematicSplash(QWidget):
         vig.setColorAt(0.0, QColor(0, 0, 0, 0))
         vig.setColorAt(0.65, QColor(0, 0, 0, 40))
         vig.setColorAt(1.0, QColor(0, 0, 0, 200))
-        p.fillRect(self.rect(), QBrush(vig))
+        p.fillRect(QRectF(0, 0, w, h), QBrush(vig))
 
-        # 3) CRT scanlines.
-        p.save()
-        p.setPen(QPen(QColor(120, 200, 255, 32), 1))
-        spacing = 4
-        y = int(t * 26.0) % spacing
-        while y < h:
-            p.drawLine(0, y, w, y)
-            y += spacing
-        p.restore()
+        # 6) Corner brackets (static — no time dependence).
+        p.setPen(QPen(QColor(62, 200, 255, 150), 2))
+        L = 44
+        for sx, sy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+            x0 = margin if sx > 0 else w - margin
+            y0 = margin if sy > 0 else h - margin
+            p.drawLine(x0, y0 + sy * L, x0, y0)
+            p.drawLine(x0, y0, x0 + sx * L, y0)
+
+        # 8) Title block (static).
+        p.setFont(self._title_font)
+        p.setPen(QColor(210, 240, 255, 235))
+        p.drawText(QRectF(margin, 36, w - margin * 2, 40),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "J.A.R.V.I.S.")
+        p.setFont(self._mono_small)
+        p.setPen(QColor(120, 200, 235, 170))
+        p.drawText(QRectF(margin + 4, 76, w - margin * 2, 16),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "STARK INDUSTRIES  //  SYSTEM BOOT")
+
+        p.end()
+        return cache
+
+    def paintEvent(self, event):
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        t = self._t
+        margin = 24
+
+        # 1) Cached backdrop (photo + vignette + brackets + title). Re-rasterised
+        #    on resize or every ~100 ms, then blitted whole each frame — no
+        #    per-frame fullscreen smooth-scale or gradient fills.
+        if (self._bg_cache is None or self._bg_cache_size != (w, h)
+                or t - self._bg_cache_t >= 0.1):
+            self._bg_cache = self._render_backdrop(w, h, t)
+            self._bg_cache_size = (w, h)
+            self._bg_cache_t = t
+            self._scan_px = self._make_scanline_px(w, h)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.drawPixmap(0, 0, self._bg_cache)
+
+        # 3) CRT scanlines — pre-rendered layer, scrolled via ≤2 cheap blits.
+        if self._scan_px is not None:
+            _blit_scrolling_scanlines(p, self._scan_px, w, h, int(t * 26.0) % 4)
 
         # 4) Bright sweep band moving down the screen.
         p.save()
@@ -3784,17 +3931,6 @@ class _CinematicSplash(QWidget):
             p.drawEllipse(QPointF(x * w, y * h), r, r)
         p.restore()
 
-        # 6) Corner brackets.
-        p.save()
-        p.setPen(QPen(QColor(62, 200, 255, 150), 2))
-        L = 44
-        for sx, sy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
-            x0 = margin if sx > 0 else w - margin
-            y0 = margin if sy > 0 else h - margin
-            p.drawLine(x0, y0 + sy * L, x0, y0)
-            p.drawLine(x0, y0, x0 + sx * L, y0)
-        p.restore()
-
         # 7) Rotating reticle (bottom-right).
         p.save()
         rc = QPointF(w - 118.0, h - 118.0)
@@ -3817,27 +3953,13 @@ class _CinematicSplash(QWidget):
         )
         p.restore()
 
-        # 8) Title block.
-        p.save()
-        p.setFont(self._title_font)
-        p.setPen(QColor(210, 240, 255, 235))
-        p.drawText(QRectF(margin, 36, w - margin * 2, 40),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   "J.A.R.V.I.S.")
-        p.setFont(self._mono_small)
-        p.setPen(QColor(120, 200, 235, 170))
-        p.drawText(QRectF(margin + 4, 76, w - margin * 2, 16),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   "STARK INDUSTRIES  //  SYSTEM BOOT")
-        p.restore()
-
         # 9) Boot log (bottom-left).
         p.save()
         p.setFont(self._mono_font)
         line_h = 22
         block_h = len(_SPLASH_BOOT_LINES) * line_h
         block_top = h - margin - 18 - block_h
-        fm = QFontMetrics(self._mono_font)
+        fm = self._mono_fm
         for i, text in enumerate(_SPLASH_BOOT_LINES):
             a = self._boot_line_alpha(i)
             if a <= 0.0:
@@ -3860,6 +3982,183 @@ class _CinematicSplash(QWidget):
                     p.setPen(Qt.PenStyle.NoPen)
                     tw = fm.horizontalAdvance(text)
                     p.drawRect(int(margin + 20 + tw + 6), int(cy_line - 7), 7, 14)
+        p.restore()
+
+        p.end()
+
+
+class _HudRoot(QWidget):
+    """Main-window backdrop: the Stark photo + ambient HUD drift.
+
+    Painted as the central widget's own background (not a separate overlay) so
+    the translucent neural-core and the gaps between panels reveal it
+    consistently. Kept deliberately subdued — dark wash, faint scanlines, slow
+    particles — so the panels and text stay readable while the splash aesthetic
+    carries through into the live interface.
+    """
+
+    def __init__(self, image_path: str = "", parent=None):
+        super().__init__(parent)
+        self._t = 0.0
+        self._last_t = time.monotonic()
+
+        scr = QApplication.primaryScreen().size()
+        src = QPixmap(image_path) if image_path else QPixmap()
+        if not src.isNull() and src.width() > 0 and src.height() > 0:
+            s = max(scr.width() / src.width(), scr.height() / src.height())
+            self._cover = src.scaled(
+                max(1, int(src.width() * s)),
+                max(1, int(src.height() * s)),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        else:
+            self._cover = QPixmap()
+
+        rng = random.Random(20260817)
+        self._particles = [
+            (rng.random(), rng.random(), rng.uniform(0.4, 1.6), rng.uniform(0.6, 1.8))
+            for _ in range(48)
+        ]
+
+        # The backdrop paints every pixel itself, so skip Qt's automatic
+        # background fill (avoids a redundant full-window clear each frame).
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+        # Cached backdrop layer (photo + wash + vignette). The zoom/drift are
+        # extremely slow, so re-rendering it only on resize or every 200 ms is
+        # visually identical — but it removes the full-screen smooth-scaling and
+        # two full-screen gradient fills from every frame.
+        self._bg_cache = None
+        self._bg_cache_size = (-1, -1)
+        self._bg_cache_t = -1.0
+        self._scan_px = None
+
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._step)
+        self._tmr.start(33)
+
+    def pause_animation(self) -> None:
+        """Freeze the backdrop drift (used while the splash covers the window)."""
+        self._tmr.stop()
+
+    def resume_animation(self) -> None:
+        if not self._tmr.isActive():
+            self._last_t = time.monotonic()
+            self._tmr.start()
+
+    def _make_scanline_px(self, w: int, h: int) -> QPixmap:
+        """Pre-render the faint CRT scanline layer (one line every 4 px)."""
+        px = QPixmap(w, h)
+        px.fill(Qt.GlobalColor.transparent)
+        sp = QPainter(px)
+        sp.setPen(QPen(QColor(120, 200, 255, 16), 1))
+        y = 0
+        while y < h:
+            sp.drawLine(0, y, w, y)
+            y += 4
+        sp.end()
+        return px
+
+    def _step(self) -> None:
+        # Drive the drift from the *real* elapsed time (not a fixed per-tick
+        # increment) so uneven timer firings don't make the particles stutter.
+        now = time.monotonic()
+        dt = max(0.0, min(0.05, now - self._last_t))
+        self._last_t = now
+        self._t += dt
+        self.update()
+
+    def _render_backdrop(self, w: int, h: int, t: float) -> QPixmap:
+        """Rasterise the expensive, near-static backdrop into one pixmap.
+
+        Runs only on resize or every ~200 ms, so the per-frame paint can be a
+        plain blit instead of a full-screen smooth-scale + two gradient fills.
+        """
+        cache = QPixmap(w, h)
+        cache.fill(QColor(C.BG))
+        p = QPainter(cache)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        cx, cy = w / 2.0, h / 2.0
+
+        # Stark photo — very slow zoom + parallax drift.
+        if not self._cover.isNull():
+            zoom = 1.0 + 0.04 * (0.5 + 0.5 * math.sin(t * 0.12))
+            drift_x = math.sin(t * 0.18) * 10.0
+            drift_y = math.cos(t * 0.15) * 8.0
+            dw = self._cover.width() * zoom
+            dh = self._cover.height() * zoom
+            p.drawPixmap(
+                QRectF(cx - dw / 2.0 + drift_x, cy - dh / 2.0 + drift_y, dw, dh),
+                self._cover,
+                QRectF(self._cover.rect()),
+            )
+
+        # Subdued dark wash — keeps the photo ambient, panels readable.
+        wash = QLinearGradient(0, 0, 0, h)
+        wash.setColorAt(0.0, QColor(5, 8, 12, 130))
+        wash.setColorAt(0.5, QColor(5, 8, 12, 100))
+        wash.setColorAt(1.0, QColor(5, 8, 12, 150))
+        p.fillRect(QRectF(0, 0, w, h), QBrush(wash))
+
+        # Vignette.
+        vig = QRadialGradient(QPointF(cx, cy), max(w, h) * 0.78)
+        vig.setColorAt(0.0, QColor(0, 0, 0, 0))
+        vig.setColorAt(0.7, QColor(0, 0, 0, 30))
+        vig.setColorAt(1.0, QColor(0, 0, 0, 150))
+        p.fillRect(QRectF(0, 0, w, h), QBrush(vig))
+
+        p.end()
+        return cache
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            p.end()
+            return
+        cx, cy = w / 2.0, h / 2.0
+        t = self._t
+
+        # 1) Backdrop — cached, pre-composited photo + wash + vignette blitted
+        #    whole (no per-frame smooth-scaling or gradient fills). Re-render the
+        #    cache only on resize or when the slow zoom/drift has advanced.
+        if (self._bg_cache is None or self._bg_cache_size != (w, h)
+                or t - self._bg_cache_t >= 0.2):
+            self._bg_cache = self._render_backdrop(w, h, t)
+            self._bg_cache_size = (w, h)
+            self._bg_cache_t = t
+            self._scan_px = self._make_scanline_px(w, h)
+        p.drawPixmap(0, 0, self._bg_cache)
+
+        # CRT scanlines (faint) — pre-rendered layer, scrolled via ≤2 blits.
+        if self._scan_px is not None:
+            _blit_scrolling_scanlines(p, self._scan_px, w, h, int(t * 18.0) % 4)
+
+        # 5) Slow sweep band.
+        p.save()
+        frac = (t * 0.10) % 1.0
+        band_cy = frac * h
+        band = max(20.0, h * 0.08)
+        band_g = QLinearGradient(0, band_cy - band, 0, band_cy + band)
+        band_g.setColorAt(0.0, QColor(110, 210, 255, 0))
+        band_g.setColorAt(0.5, QColor(110, 210, 255, 22))
+        band_g.setColorAt(1.0, QColor(110, 210, 255, 0))
+        p.fillRect(0, int(band_cy - band), w, int(band * 2.0), QBrush(band_g))
+        p.restore()
+
+        # 6) Drifting particles (subdued).
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        for (px, py, spd, sz) in self._particles:
+            x = (px + t * spd * 0.03) % 1.0
+            y = (py - t * spd * 0.05) % 1.0
+            r = sz * 1.5
+            a = int(50 + 40 * math.sin(t * 2.0 + px * 40.0))
+            p.setBrush(QColor(120, 215, 255, max(0, a)))
+            p.drawEllipse(QPointF(x * w, y * h), r, r)
         p.restore()
 
         p.end()
@@ -3985,27 +4284,37 @@ def _show_startup_splash(image_path: str, seconds: float = _SPLASH_TOTAL, music=
 
         splash.showFullScreen()
 
-        # Drive the animation on the main thread (pumping events), ~40 fps.
+        # Drive the animation with a precise QTimer inside a nested QEventLoop —
+        # no time.sleep() and no manual processEvents() pumping. This gives
+        # event-driven ~60 fps and keeps the main thread responsive.
         total = max(0.5, float(seconds))
-        start = time.time()
-        frame = 1.0 / 40.0
-        while True:
-            elapsed = time.time() - start
+        start = time.monotonic()
+
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setTimerType(Qt.TimerType.PreciseTimer)
+        timer.setInterval(16)  # ~60 fps
+
+        def _tick() -> None:
+            elapsed = time.monotonic() - start
             if elapsed >= total:
+                timer.stop()
                 splash.set_time(total)
                 splash.setWindowOpacity(0.0)
                 splash.update()
-                QApplication.processEvents()
-                break
-
+                loop.quit()
+                return
             splash.set_time(elapsed)
             splash.setWindowOpacity(_splash_window_alpha(elapsed, total))
             splash.update()
-            QApplication.processEvents()
-            time.sleep(frame)
+
+        timer.timeout.connect(_tick)
+        timer.start()
+        loop.exec()  # nested event loop drives the animation until finished
 
         splash.close()
         splash.deleteLater()
+        timer.deleteLater()
         QApplication.processEvents()
         # Music keeps playing on its own — the decoded tail fades out over ~5s
         # while JARVIS is already visible underneath.
@@ -4044,19 +4353,22 @@ class JarvisUI:
         self._win.showFullScreen()
 
         # Let the main window paint once (warm its render surface), then freeze
-        # the neural-core animation while the splash plays — otherwise JARVIS
-        # keeps repainting underneath the splash and the reveal stutters.
+        # the neural-core AND backdrop animations while the splash plays — the
+        # splash covers the whole screen, so repainting the main UI underneath
+        # would waste CPU and make the reveal stutter.
         QApplication.processEvents()
         self._win.core.pause_animation()
+        self._win.centralWidget().pause_animation()
 
         _splash = BASE_DIR / "splash.png"
         if not _splash.exists():
             _splash = BASE_DIR / "face.png"
         _show_startup_splash(str(_splash) if _splash.exists() else "", seconds=_SPLASH_TOTAL, music=music)
 
-        # Hand the screen back to JARVIS: resume the core animation and present
+        # Hand the screen back to JARVIS: resume the animations and present
         # the window immediately so the splash→GUI transition is smooth.
         self._win.core.resume_animation()
+        self._win.centralWidget().resume_animation()
         self._win.raise_()
         self._win.activateWindow()
         QApplication.processEvents()
@@ -4149,4 +4461,4 @@ class JarvisUI:
 
     def stop_speaking(self):
         if not self.muted:
-            self.set_state("LISTENING")
+            self.set_state("IDLE")

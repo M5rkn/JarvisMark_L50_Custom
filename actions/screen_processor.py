@@ -35,6 +35,7 @@ except ImportError:
 
 from google import genai
 from google.genai import types as gtypes
+from actions.computer_vision import capture_screen, describe_capture
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -107,18 +108,17 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         print(f"[Vision] ⚠️  Image compress failed: {e}")
         return img_bytes, f"image/{source_format.lower()}"
 
-def _capture_screen() -> tuple[bytes, str]:
-
-    if not _MSS:
-        raise RuntimeError("mss is not installed. Run: pip install mss")
-
-    with mss.mss() as sct:
-        monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
-        target   = monitors[1] if len(monitors) > 1 else monitors[0]
-        shot     = sct.grab(target)
-        png      = mss.tools.to_png(shot.rgb, shot.size)
-
+def _capture_screen(target: str = "fullscreen", region: dict | None = None) -> tuple[bytes, str]:
+    """Compatibility wrapper used by the Live client; captures stay in memory."""
+    png, _mime, _info = capture_screen(target=target, region=region)
     return _compress(png, "PNG")
+
+
+def _capture_screen_with_metadata(target: str = "fullscreen", region: dict | None = None) -> tuple[bytes, str, str]:
+    """One-shot screen capture plus local OCR/window metadata for the model."""
+    png, _mime, info = capture_screen(target=target, region=region)
+    image_bytes, mime_type = _compress(png, "PNG")
+    return image_bytes, mime_type, describe_capture(png, info)
 
 
 def _cv2_backend() -> int:
