@@ -16,6 +16,9 @@ existing JARVIS infrastructure (``actions.open_app`` + ``actions.browser_control
 
 from __future__ import annotations
 
+import os
+import platform
+import subprocess
 import time
 from urllib.parse import quote_plus
 
@@ -126,17 +129,31 @@ class Skill(SkillBase):
             query = (args.get("name") or args.get("query") or "").strip()
             if not query:
                 return "Spotify: I need a playlist or track name."
-            _open_spotify(context)
-            time.sleep(2.5)
-            from actions.browser_control import browser_control
 
+            # Primary: Spotify URI scheme — opens search directly in the desktop
+            # app without touching the browser at all. No Playwright, no about:blank.
+            uri = f"spotify:search:{quote_plus(query)}"
+            try:
+                _sys = platform.system()
+                if _sys == "Windows":
+                    os.startfile(uri)
+                elif _sys == "Darwin":
+                    subprocess.Popen(["open", uri])
+                else:
+                    subprocess.Popen(["xdg-open", uri],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                return f"Spotify: searching for '{query}' in the Spotify app."
+            except Exception as _e:
+                print(f"[spotify] URI scheme failed ({_e}), falling back to web player")
+
+            # Fallback: navigate to Spotify Web Player in the existing real browser.
+            # Uses go_to (native, no Playwright) — never opens a new window or
+            # creates an about:blank tab.
+            from actions.browser_control import browser_control
             url = "https://open.spotify.com/search/" + quote_plus(query)
             browser_control(parameters={"action": "go_to", "url": url}, player=context.ui)
-            time.sleep(3.0)
-            browser_control(parameters={"action": "click_first_result"}, player=context.ui)
-            time.sleep(1.5)
-            _press("playpause")
-            return f"Spotify: playing '{query}'."
+            return f"Spotify: opened search for '{query}' in the browser."
 
         if action == "open":
             _open_spotify(context)
