@@ -130,30 +130,29 @@ class Skill(SkillBase):
             if not query:
                 return "Spotify: I need a playlist or track name."
 
-            # Primary: Spotify URI scheme — opens search directly in the desktop
-            # app without touching the browser at all. No Playwright, no about:blank.
-            uri = f"spotify:search:{quote_plus(query)}"
+            url = "https://open.spotify.com/search/" + quote_plus(query)
+
+            # Open the search URL directly in Chrome (new tab in the existing
+            # window). We bypass browser_control entirely here because its go_to
+            # action short-circuits on an existing Spotify tab without updating
+            # the URL, and its interactive actions (click_first_result) launch a
+            # separate Playwright browser with an about:blank tab.
+            # os.startfile / xdg-open hands the URL to the OS default browser —
+            # Chrome opens it as a new tab, no extra windows, no Playwright.
             try:
                 _sys = platform.system()
                 if _sys == "Windows":
-                    os.startfile(uri)
+                    os.startfile(url)
                 elif _sys == "Darwin":
-                    subprocess.Popen(["open", uri])
+                    subprocess.Popen(["open", url])
                 else:
-                    subprocess.Popen(["xdg-open", uri],
+                    subprocess.Popen(["xdg-open", url],
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
-                return f"Spotify: searching for '{query}' in the Spotify app."
             except Exception as _e:
-                print(f"[spotify] URI scheme failed ({_e}), falling back to web player")
-
-            # Fallback: navigate to Spotify Web Player in the existing real browser.
-            # Uses go_to (native, no Playwright) — never opens a new window or
-            # creates an about:blank tab.
-            from actions.browser_control import browser_control
-            url = "https://open.spotify.com/search/" + quote_plus(query)
-            browser_control(parameters={"action": "go_to", "url": url}, player=context.ui)
-            return f"Spotify: opened search for '{query}' in the browser."
+                import webbrowser
+                webbrowser.open(url)
+            return f"Spotify: opened search for '{query}'."
 
         if action == "open":
             _open_spotify(context)
